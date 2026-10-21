@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# DSS observations, credentials, checkpoints and local runtime state
+data/
+models/
+*.lock
+.streamlit/cache/
