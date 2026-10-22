@@ -46,3 +46,19 @@ def test_existing_collector_workbook_and_dynamic_discovery(tmp_path):
     assert sheets["Funds"].id.iloc[0] == "17914401175772326"
     batch = CollectorAdapter().read(result.file_path)
     assert len(batch.tables["prices"]) == 2
+
+def test_invalid_api_key_http_error_does_not_expose_key():
+    import pytest
+    import requests
+    class Response:
+        status_code = 401
+        def raise_for_status(self):
+            raise requests.HTTPError("https://api.example/?key=fixture-secret", response=self)
+    class Session:
+        headers = {}
+        def get(self, *args, **kwargs):
+            return Response()
+    collector = LeveragedFundsCollector(api_key="fixture-secret", session=Session())
+    with pytest.raises(MarketDataError, match="HTTP 401") as error:
+        collector._get("AllSymbols.php", type=1)
+    assert "fixture-secret" not in str(error.value)

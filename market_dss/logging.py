@@ -20,6 +20,9 @@ class JsonFormatter(logging.Formatter):
 
 def configure_logging(path, level="INFO"):
     path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("market_dss")
+    if logger.handlers:
+        return
     handler = RotatingFileHandler(path, maxBytes=2_000_000, backupCount=4, encoding="utf-8")
     handler.setFormatter(JsonFormatter())
     logger = logging.getLogger("market_dss")

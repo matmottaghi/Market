@@ -1,6 +1,7 @@
 """Atomic, locked Excel snapshots. Raw inputs are immutable, content-addressed archives."""
 
 from contextlib import suppress
+from functools import lru_cache
 import hashlib
 from io import BytesIO
 import json
@@ -70,6 +71,15 @@ def atomic_bytes(path, content, backup=False):
             os.unlink(temporary)
 
 
+@lru_cache(maxsize=4)
+def _cached_workbook(path, modified_ns, size):
+    result = {}
+    for sheet, frame in pd.read_excel(path, sheet_name=None, dtype=str).items():
+        name = sheet.rsplit("__", 1)[0]
+        result[name] = pd.concat([result.get(name, pd.DataFrame()), frame], ignore_index=True)
+    return result
+
+
 class ExcelRepository:
     def __init__(self, path, max_rows=1_000_000):
         self.path = Path(path)
@@ -89,7 +99,11 @@ class ExcelRepository:
 
     def read_all(self):
         with self.lock:
-            return self._read_all()
+            if not self.path.exists():
+                return {}
+            stamp = self.path.stat()
+            tables = _cached_workbook(str(self.path.resolve()), stamp.st_mtime_ns, stamp.st_size)
+            return {name: frame.copy(deep=True) for name, frame in tables.items()}
 
     def read(self, name):
         return self.read_all().get(name, pd.DataFrame())

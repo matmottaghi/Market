@@ -10,8 +10,8 @@ def test_all_seven_pages_empty_data(tmp_path, monkeypatch):
     monkeypatch.setenv("DSS_MODEL_DIR", str(tmp_path / "models"))
     app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py"), default_timeout=30).run()
     assert not app.exception
-    for page in app.sidebar.radio[0].options:
-        app.sidebar.radio[0].set_value(page).run()
+    for page in ["market", "forecast", "options", "strategy", "decision", "backtest", "settings"]:
+        app.switch_page(f"market_dss/pages/{page}.py").run()
         assert not app.exception, page
         assert not app.error, page
 
@@ -71,19 +71,19 @@ def test_dashboard_forecast_strategy_decision_flow(
         synthetic_history
     ).save(tmp_path / "models")
     app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py"), default_timeout=30).run()
-    app.sidebar.radio[0].set_value("پیش‌بینی").run()
+    app.switch_page("market_dss/pages/forecast.py").run()
     next(button for button in app.button if button.label == "تولید توزیع پیش‌بینی").click().run()
     assert not app.exception
     assert not app.error, [error.value for error in app.error]
-    app.sidebar.radio[0].set_value("بازار اختیار معامله").run()
+    app.switch_page("market_dss/pages/options.py").run()
     assert not app.error
-    app.sidebar.radio[0].set_value("ساخت استراتژی").run()
+    app.switch_page("market_dss/pages/strategy.py").run()
     app.multiselect[0].set_value([c.instrument_id]).run()
     next(button for button in app.button if button.label == "محاسبه استراتژی").click().run()
     assert not app.exception
     assert not app.error, [error.value for error in app.error]
     next(button for button in app.button if button.label == "افزودن به مقایسه تصمیم").click().run()
-    app.sidebar.radio[0].set_value("پشتیبانی تصمیم").run()
+    app.switch_page("market_dss/pages/decision.py").run()
     assert not app.exception
     assert not app.error, [error.value for error in app.error]
     assert len(app.dataframe) >= 2

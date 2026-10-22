@@ -1,5 +1,21 @@
 # Iranian Market Decision Support System
 
+راهنمای فارسی نصب، معماری، آدرس صفحات و بررسی نتایج: [راهنمای سیستم](docs/LOCAL_GUIDE_FA.md).
+
+اجرای ویندوز: `Start-Market.cmd -Install` برای نصب اولیه؛ سپس `Start-Market.cmd`. وضعیت واقعی این سیستم: [گزارش اعتبارسنجی](docs/VALIDATION_REPORT.md).
+
+ناوبری هفت صفحه در بالای داشبورد قرار دارد. در «تنظیمات و داده‌ها»، نمادها و کلید اختیاری BrsApi را تنظیم کنید و «اجرای کامل پایپلاین» را بزنید. تاریخچه TSETMC بدون کلید دریافت و اکسل خودکار ساخته می‌شود؛ مدل اولیه و بازآموزی دوره‌ای خودکار است. ارزیابی، منحنی یادگیری و مدیریت مدل فقط در صفحه «پیش‌بینی» و چهار تب اختصاصی آن نمایش داده می‌شوند.
+
+در بررسی واقعی همین سیستم، ۲۶۰۷ مشاهده معتبر برای اهرم، موج و توان ذخیره شد. سه مدل با منحنی یادگیری واقعی و ۹ پیش‌بینی آماده‌اند. قیمت جاری عمومی هر سه صندوق از TSETMC دریافت شده؛ BrsApi احراز هویت‌شده، NAV و اختیار هنوز در این محیط تأیید نشده‌اند. ۶۹ تست خودکار و Ruff موفق‌اند. جزئیات تست‌ها و محدودیت‌ها در گزارش اعتبارسنجی آمده است.
+
+راهنماهای تکمیلی: [تشخیص API](docs/LIVE_API_DIAGNOSTICS.md)، [پوشش تاریخچه](docs/HISTORICAL_COVERAGE.md)، [آموزش و ارزیابی LSTM](docs/LSTM_TRAINING_VALIDATION.md)، [فونت و چیدمان](docs/FRONTEND_TYPOGRAPHY.md).
+
+```powershell
+.\.venv\Scripts\python.exe -m market_dss pipeline --symbols 'اهرم' 'موج' 'توان'
+# Public historical workflow only:
+.\.venv\Scripts\python.exe -m market_dss pipeline --symbols 'اهرم' 'موج' 'توان' --no-live
+```
+
 A runnable Python/Streamlit DSS for Iranian stocks, ETFs and listed options. The existing Django starter (`manage.py`, `Stocks/`, `DataAnalysis/`) remains independent. No external database or order execution is required.
 
 The seven Persian RTL pages cover market history, probabilistic forecasts, option chains, multi-leg strategies, forecast-based strategy ranking, backtesting and data management. All money is stored in **rial**; the dashboard optionally displays toman (10 rial).
@@ -7,18 +23,18 @@ The seven Persian RTL pages cover market history, probabilistic forecasts, optio
 ## Install and run (PowerShell, Python 3.11+)
 
 ```powershell
-cd E:\Market
-python -m venv .venv
+cd E:\Work\Market
+py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 # Edit .env and set your own BRS_API_KEY if live collection is needed.
 .\.venv\Scripts\python.exe -m market_dss init
 .\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-Open `http://localhost:8501`. The initial dashboard is empty by design: **no demo prices, contracts or performance metrics are mixed with market observations**. Tests generate synthetic fixtures only inside temporary test directories. A CPU PyTorch installation is sufficient; a compatible CUDA build can be installed separately when needed.
+Open `http://localhost:8501`. A fresh installation has no seeded market observations: **no demo prices, contracts or performance metrics are mixed with market observations**. Tests generate synthetic fixtures only inside temporary test directories. A CPU PyTorch installation is sufficient; a compatible CUDA build can be installed separately when needed.
 
-Dependencies were installed and exercised in the project virtual environment. `requirements-lock.txt` records the resolved versions used for validation; the existing Django dependencies are included in that environment snapshot.
+`requirements-lock.txt` is an inherited environment snapshot, not evidence of installation on this workstation. Current installation and verification limits are recorded in `docs/VALIDATION_REPORT.md`.
 
 ## Connect the supplied collector
 
@@ -55,7 +71,7 @@ The dashboard offers the same import, refresh, validation and export actions, pl
 .\.venv\Scripts\python.exe -m ruff check market_dss tests app.py leveraged_funds_collector.py
 ```
 
-`train` also accepts `--attention` and `--device cuda`. Training requires at least 180 complete feature rows, plus enough observations for each purged horizon partition; a 21-session model normally needs several hundred observations. Insufficient data produces an explicit error. Versions live in `models/<instrument_id>/<version>/`, with tensor weights, configuration/scaler/residual metadata and `evaluation.xlsx`. Only locally trusted checkpoints should be used; weights are loaded with PyTorch's restricted `weights_only=True` mode.
+`train` also accepts `--attention` and `--device cuda`. Training requires at least 180 complete feature rows, plus enough observations for each purged horizon partition; a 21-session model normally needs several hundred observations. Insufficient data produces an explicit error. Versions live in `models/<instrument_id>/<version>/`, with tensor weights, configuration/scaler/residual metadata, `evaluation.xlsx` and `training_history.xlsx`. Only locally trusted checkpoints should be used; weights are loaded with PyTorch's restricted `weights_only=True` mode.
 
 The LSTM predicts a vector of future log returns. Training, early-stopping validation, residual calibration and test partitions occupy 60/10/15/15 percent of feature rows, with targets purged across boundaries. The scaler and return normalization are fit only on training rows. Dropout draws and held-out residual vectors produce coherent positive price paths. Returned metadata identifies the instrument, source, cutoff, model version, random seed, horizon and generation time.
 
@@ -87,7 +103,7 @@ Early-horizon evaluation uses European BSM under explicit volatility, continuous
 
 Set `DSS_UPDATE_HOUR`, `DSS_UPDATE_MINUTE` and `DSS_RETRAIN_DAYS` in `.env`. Default update time is 16:30 Asia/Tehran on Saturday–Wednesday; configurable holiday exclusions also apply. Training failures are logged by instrument. Copy `config/holidays.example.csv` to `config/holidays.csv` and enter verified exchange closure dates. An empty/missing file does **not** mean the calendar is complete. Sessions are never forward-filled into price history.
 
-For Windows Task Scheduler, create a daily task with program `E:\Market\.venv\Scripts\python.exe`, arguments `-m market_dss update --history`, and **Start in** `E:\Market`. Configure the trigger in the workstation's local timezone and avoid overlap with the APScheduler process. No system task is installed automatically.
+For Windows Task Scheduler, create a daily task with program `E:\Work\Market\.venv\Scripts\python.exe`, arguments `-m market_dss update --history`, and **Start in** `E:\Work\Market`. Configure the trigger in the workstation's local timezone and avoid overlap with the APScheduler process. No system task is installed automatically.
 
 ## Module map
 
@@ -105,6 +121,6 @@ For Windows Task Scheduler, create a daily task with program `E:\Market\.venv\Sc
 
 ## Operational status
 
-This is a tested local implementation with production-oriented data protections, not a claim of production deployment or profitable forecasting. The workspace initially contained no market datasets or API credentials. Authenticated live responses, actual exchange contract terms, a complete holiday calendar and real options backtest results remain unverified. Direct TSETMC and direct Codal integrations are deliberately unavailable instead of using undocumented fields. Provider references and the verification boundary are recorded in [sources.md](docs/sources.md).
+This is a tested local implementation with production-oriented data protections, not a claim of production deployment or profitable forecasting. The workspace initially contained no market datasets or API credentials. Authenticated live responses, actual exchange contract terms, a complete holiday calendar and real options backtest results remain unverified. The public TSETMC history integration is implemented and live-tested; its undocumented service can still be blocked or change schema. Direct Codal integration remains unavailable. Provider references and the verification boundary are recorded in [sources.md](docs/sources.md).
 
 Excel remains the source of truth. A write replaces the whole canonical workbook; this favors correctness and portability over large-scale throughput. Worksheets split before Excel's row limit, but very large universes can exceed practical memory/file-size limits. Raw archives and backups require disk monitoring and an external retention/backup policy.

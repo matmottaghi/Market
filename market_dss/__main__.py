@@ -12,6 +12,11 @@ def main():
     parser = argparse.ArgumentParser(description="Iran market DSS: Excel, LSTM and options analytics")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init")
+    pipeline = commands.add_parser("pipeline")
+    pipeline.add_argument("--symbols", nargs="+")
+    pipeline.add_argument("--no-live", action="store_true")
+    pipeline.add_argument("--data-only", action="store_true")
+    pipeline.add_argument("--retrain", action="store_true")
     importer = commands.add_parser("import")
     importer.add_argument("workbook", type=Path)
     importer.add_argument("--mapping", type=Path, help="Optional per-sheet JSON column mapping")
@@ -50,6 +55,13 @@ def main():
     service = MarketService(Settings.from_env())
     if args.command == "init":
         print("Initialized empty DSS storage; no market observations generated.")
+    elif args.command == "pipeline":
+        from .pipeline import MarketPipelineService
+        report = MarketPipelineService(service).run_full_pipeline(
+            symbols=args.symbols, update_live=not args.no_live,
+            update_forecasts=not args.data_only, retrain_policy="always" if args.retrain else "auto")
+        print(json.dumps({"run_id": report["run_id"], "status": report["status"], "counts": report["counts"],
+                          "stages": report["stages"]}, ensure_ascii=True, indent=2))
     elif args.command == "inspect":
         from .ingestion import CollectorAdapter
 

@@ -70,3 +70,13 @@ def engineer_features(history, annual_sessions=252):
         frame["nav_change"] = frame.nav.pct_change(fill_method=None)
         frame["nav_premium_pct"] = 100 * (frame.close / frame.nav - 1)
     return frame.replace([np.inf, -np.inf], np.nan)
+
+
+def prepare_model_frame(history, annual_sessions=252, feature_names=None):
+    frame = engineer_features(history, annual_sessions)
+    features = feature_names if feature_names is not None else [
+        f for f in MODEL_FEATURES if f != "volume_change" or frame[f].notna().sum() > 30]
+    ready = frame.dropna(subset=features).reset_index(drop=True)
+    if len(ready) and len(ready) != len(frame) - int(frame.index[frame.trading_date.eq(ready.trading_date.iloc[0])][0]):
+        raise ValueError("Interior missing feature observations; repair source data before training")
+    return ready, features

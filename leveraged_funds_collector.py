@@ -129,7 +129,7 @@ class LeveragedFundsCollector:
         self.session = session or requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (compatible; LeveragedFundsCollector/1.0)",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
                 "Accept": "application/json, text/plain, */*",
             }
         )
@@ -142,12 +142,16 @@ class LeveragedFundsCollector:
             self._previous_request_start = time.monotonic()
             try:
                 response = self.session.get(
-                    f"{BASE_URL}/{endpoint}", params={"key": self.api_key, **params}, timeout=(10, 45)
+                    f"{BASE_URL}/{endpoint}", params={"key": self.api_key, **params}, timeout=(10, 45), allow_redirects=False
                 )
                 if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
                     time.sleep(1.5 * 2**attempt)
                     continue
                 response.raise_for_status()
+                if 300 <= response.status_code < 400:
+                    raise MarketDataError(f"{endpoint}: redirect rejected")
+                if "text/html" in getattr(response, "headers", {}).get("Content-Type", "").lower():
+                    raise MarketDataError(f"{endpoint}: HTML error/block page rejected")
                 return records(response.json(), endpoint)
             except requests.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else "unknown"

@@ -19,9 +19,14 @@ class Settings:
     annual_sessions: int = field(default_factory=lambda: int(os.getenv("DSS_ANNUAL_SESSIONS", "252")))
     retrain_days: int = field(default_factory=lambda: int(os.getenv("DSS_RETRAIN_DAYS", "7")))
 
+    default_symbols: str = field(default_factory=lambda: os.getenv("DSS_SYMBOLS", "اهرم,موج,توان"))
+    training_epochs: int = field(default_factory=lambda: int(os.getenv("DSS_TRAINING_EPOCHS", "30")))
+
+    live_max_age_hours: int = field(default_factory=lambda: int(os.getenv("DSS_LIVE_MAX_AGE_HOURS", "48")))
+
     @classmethod
     def from_env(cls):
-        load_dotenv()
+        load_dotenv(encoding="utf-8-sig")
         return cls()
 
     def initialize(self):

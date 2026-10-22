@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import os
 
 import numpy as np
 import pandas as pd
@@ -29,13 +28,29 @@ from .storage import atomic_bytes, excel_bytes
 PAGES = [
     "نمای بازار",
     "پیش‌بینی",
-    "بازار اختیار معامله",
+    "بازار آپشن",
     "ساخت استراتژی",
     "پشتیبانی تصمیم",
     "آزمون تاریخی",
-    "مدیریت داده",
+    "تنظیمات و داده‌ها",
 ]
 LABELS = {
+    "symbols_processed": "نمادهای پردازش‌شده",
+    "historical_inserted": "مشاهدات تاریخی جدید",
+    "historical_fetched": "مشاهدات معتبر دریافت‌شده",
+    "models_updated": "مدل‌های آموزش‌دیده",
+    "option_contracts": "قراردادهای ذخیره‌شده",
+    "forecasts_updated": "پیش‌بینی‌های تازه",
+    "api_records": "رکورد API",
+    "stored_records": "رکورد ذخیره‌شده",
+    "valid_feature_rows": "ردیف آماده ویژگی",
+    "preprocessing_removed": "حذف آماده‌سازی",
+    "api_removed": "رکورد نامعتبر API",
+    "earliest_date": "ابتدای تاریخچه",
+    "latest_date": "انتهای تاریخچه",
+    "potential_session_gaps": "شکاف احتمالی جلسات",
+    "missing_values": "مقادیر مفقود",
+    "duplicates": "رکورد تکراری",
     "symbol": "نماد",
     "underlying_symbol": "نماد پایه",
     "trading_date": "تاریخ میلادی معامله",
@@ -167,8 +182,10 @@ def download(frame, name, key):
 
 def chart(figure, key):
     figure.update_layout(
-        template="plotly_white",
-        font={"family": "Tahoma, Arial", "size": 13},
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#101c30",
+        colorway=["#54d6b6", "#7daeff", "#f4bb72", "#e989a5"], hovermode="x unified",
+        font={"family": "B Roya, Tahoma, Arial, sans-serif", "size": 16},
         legend={"orientation": "h"},
         margin={"l": 25, "r": 25, "t": 45, "b": 30},
     )
@@ -191,7 +208,7 @@ def chart(figure, key):
 def require_history(service, symbol):
     history = service.history(symbol) if symbol else pd.DataFrame()
     if history.empty:
-        st.info("داده تاریخی موجود نیست. در مدیریت داده، فایل گردآورنده را وارد یا تاریخچه را دریافت کنید.")
+        st.info("داده تاریخی موجود نیست. برای دریافت خودکار اطلاعات و آماده‌سازی مدل، اجرای کامل پایپلاین را انتخاب کنید.")
         return None
     age = (pd.Timestamp.now(tz="Asia/Tehran").date() - parse_date(history.trading_date.iloc[-1])).days
     if age > 3:
@@ -203,6 +220,16 @@ def market_page(service, symbol, unit):
     history = require_history(service, symbol)
     if history is None:
         return
+    quote = service.latest_quote(symbol)
+    if quote:
+        from .live import freshness, quote_timestamp
+        stamp = quote.get("provider_quote_at") or quote_timestamp(quote)[0]
+        state = freshness(stamp, service.settings.live_max_age_hours)
+        st.caption(f"آخرین snapshot: {quote['source']} | زمان معامله: {stamp or 'نامشخص'} | "
+                   f"زمان دریافت: {quote['retrieved_at']} | وضعیت: {state}")
+        st.write("قیمت جاری دریافت‌شده:", f"{float(quote.get('last') or quote.get('close')) / unit:,.0f}")
+        if state in ("STALE", "UNKNOWN"):
+            st.warning("زمان مظنه قدیمی یا نامشخص است؛ این داده به‌عنوان قیمت اجرایی لحظه‌ای تأیید نشده است.")
     nav = service.repository.read("nav")
     if not nav.empty:
         nav = nav[
@@ -228,6 +255,14 @@ def market_page(service, symbol, unit):
     st.caption(
         f"تاریخ مشاهده: {jalali(last.trading_date)} | منبع: {last.source} | مبنای بازده: {last.price_basis}"
     )
+    details = []
+    for field, label in (("volume", "حجم معاملات"), ("value", "ارزش معاملات"), ("nav", "NAV")):
+        value = last.get(field)
+        if value is not None and pd.notna(value):
+            divisor = unit if field in ("value", "nav") else 1
+            details.append(f"{label}: {float(value) / divisor:,.0f}")
+    if details:
+        st.caption(" | ".join(details))
     lookback = st.slider(
         "تعداد مشاهدات نمودار",
         20,
@@ -244,15 +279,21 @@ def market_page(service, symbol, unit):
         ("bollinger_lower", "باند پایین"),
     ):
         figure.add_scatter(x=view.trading_date, y=view[col] / unit, name=label)
+    if {"open", "high", "low", "close"} <= set(view) and view[["open", "high", "low", "close"]].notna().all().all():
+        figure.add_trace(go.Candlestick(x=view.trading_date, open=view.open / unit,
+                                       high=view.high / unit, low=view.low / unit,
+                                       close=view.close / unit, name="کندل مشاهدات واقعی"))
+    figure.update_layout(xaxis_rangeslider_visible=False)
     chart(figure, "market_history")
     if "volume" in view:
         chart(px.bar(view, x="trading_date", y="volume", labels=LABELS, title="حجم معاملات"), "market_volume")
     choices = service.instruments().symbol.unique().tolist()
-    comparison = st.multiselect("مقایسه نمادها — قیمت ابتدای بازه برابر ۱۰۰", choices, default=[symbol])
+    comparison = st.multiselect("مقایسه نمادها — قیمت ابتدای بازه برابر ۱۰۰", choices, default=[item for item in ("اهرم", "موج", "توان") if item in choices] or [symbol])
     combined = []
     for selected in comparison:
         data = service.history(selected).tail(lookback)
         if not data.empty:
+            data = engineer_features(service.history(selected), service.settings.annual_sessions).tail(lookback)
             data = data.assign(normalized=data.close / data.close.iloc[0] * 100)
             combined.append(data)
     if combined:
@@ -260,78 +301,118 @@ def market_page(service, symbol, unit):
             px.line(pd.concat(combined), x="trading_date", y="normalized", color="symbol", labels=LABELS),
             "market_comparison",
         )
+        with st.expander("مقایسه بازده، نوسان، حجم و افت سرمایه صندوق‌ها"):
+            for field, title in (("simple_return", "بازده روزانه"), ("volatility_21", "نوسان غلتان سالانه"),
+                                 ("volume", "حجم معامله"), ("drawdown", "افت از اوج تاریخی")):
+                chart(px.line(pd.concat(combined), x="trading_date", y=field, color="symbol", title=title),
+                      f"fund_compare_{field}")
+            st.caption("NAV تنها در صورت وجود مشاهده معتبر هم‌تاریخ مقایسه می‌شود؛ مقادیر مفقود پر نمی‌شوند.")
     show_table(features.tail(30), unit)
     download(features, "indicators", "market_export")
 
 
 def forecast_page(service, symbol, unit):
-    from .forecasting import ForecastEngine, ModelConfig
+    from .forecasting import Forecast, ForecastEngine, ModelConfig, load_model_artifacts
 
-    history = require_history(service, symbol)
-    if history is None:
+    choices = list(dict.fromkeys([*(service.instruments().symbol.tolist() if not service.instruments().empty else []),
+                                  "اهرم", "موج", "توان"]))
+    symbol = st.selectbox("نماد مدل", choices, index=choices.index(symbol) if symbol in choices else 0,
+                          key="forecast_symbol")
+    tabs = st.tabs(["پیش‌بینی قیمت", "منحنی یادگیری", "ارزیابی عملکرد مدل", "مدیریت مدل"])
+    history = service.history(symbol)
+    if history.empty:
+        for tab in tabs:
+            with tab:
+                st.info("تاریخچه این نماد موجود نیست؛ در تنظیمات و داده‌ها، پایپلاین کامل را اجرا کنید.")
         return
     identifier = str(history.instrument_id.iloc[-1])
-    with st.expander("آموزش مدل", expanded=not bool(service.models(identifier))):
-        cols = st.columns(4)
-        horizon_train = cols[0].number_input("حداکثر افق مدل (جلسه)", 1, 126, 21)
-        window = cols[1].number_input("طول پنجره", 5, 200, 30)
-        epochs = cols[2].number_input("حداکثر دوره آموزش", 1, 500, 60)
-        lookback = cols[3].number_input(
-            "مشاهدات مورد استفاده", 50, max(500, len(history)), min(1000, max(50, len(history)))
-        )
-        attention = st.checkbox("لایه توجه")
-        if st.button("آموزش و ارزیابی زمانی", type="primary"):
-            with st.spinner("آموزش و محاسبه نتایج خارج از نمونه…"):
-                model = ForecastEngine(
-                    ModelConfig(
-                        horizon=horizon_train,
-                        window=window,
-                        epochs=epochs,
-                        attention=attention,
-                        annual_sessions=service.settings.annual_sessions,
-                    )
-                ).fit(history.tail(lookback))
-                model.save(service.settings.model_dir)
-            st.success("مدل و گزارش ارزیابی ذخیره شد.")
     versions = service.models(identifier)
-    if not versions:
-        st.info("هنوز مدل آموزش‌دیده‌ای برای این نماد وجود ندارد. داده کم، پیش‌بینی تولید نمی‌کند.")
+    selected = st.selectbox("نسخه مدل", versions, format_func=lambda path: path.parent.name,
+                            key=f"model_version_{identifier}") if versions else None
+    artifact = load_model_artifacts(selected.parent) if selected else None
+    max_horizon = artifact["config"]["horizon"] if artifact else 21
+    horizons = [h for h in (1, 5, 21) if h <= max_horizon]
+    horizon = st.selectbox("افق پیش‌بینی (جلسه)", horizons, index=len(horizons)-1, key=f"model_horizon_{identifier}",
+                           format_func=lambda h: {1:"۱ جلسه — روزانه", 5:"۵ جلسه — هفتگی", 21:"۲۱ جلسه — ماهانه"}[h])
+    with tabs[3]:
+        st.subheader("مدیریت مدل")
+        st.caption(f"نماد: {symbol} | افق انتخابی: {horizon} | آخرین معامله داده: {jalali(history.trading_date.iloc[-1])}")
+        st.caption(f"تعداد مشاهدات ورودی: {len(history):,} | آخرین دریافت: {history.retrieved_at.max()}")
+        if artifact:
+            metadata = artifact["metadata"]
+            st.caption(f"نسخه: {metadata['version']} | آموزش: {metadata['created_at']} | برش داده: {metadata['input_data_cutoff']}")
+            st.write("وضعیت بازآموزی:", "موعد بازآموزی رسیده" if service.training_due(identifier) else "مدل ذخیره‌شده موجود است")
+            st.write("مشاهدات آماده ویژگی:", metadata.get("eligible_feature_rows", "در نسخه قدیمی ثبت نشده"))
+            training = metadata.get("partitions", {}).get("train", {})
+            st.write("مشاهدات بخش آموزش:", training.get("observations", "ثبت نشده"),
+                     " | پنجره‌های آموزشی:", training.get("samples", "ثبت نشده"))
+            show_table(pd.DataFrame([artifact["config"]]))
+            st.success("گزارش‌ها و مشخصات مدل از فایل ذخیره‌شده خوانده شد؛ بارگذاری وزن‌ها فقط هنگام پیش‌بینی انجام می‌شود.")
+        cols = st.columns(4)
+        train_horizon = cols[0].number_input("حداکثر افق مدل (جلسه)", 1, 126, 21)
+        window = cols[1].number_input("طول پنجره", 5, 200, 30)
+        epochs = cols[2].number_input("حداکثر دوره آموزش", 1, 500, service.settings.training_epochs)
+        hidden = cols[3].number_input("اندازه لایه پنهان", 4, 128, 32)
+        attention = st.checkbox("لایه توجه")
+        st.caption("تمام تاریخچه معتبر استفاده می‌شود؛ بخش آزمون زمانی وارد آموزش نمی‌شود.")
+        if st.button("آموزش مجدد مدل", type="primary", key="forecast_retrain"):
+            with st.spinner("آموزش، اعتبارسنجی زمانی و ذخیره منحنی یادگیری…"):
+                engine = ForecastEngine(ModelConfig(horizon=train_horizon, window=window, epochs=epochs,
+                    hidden_size=hidden, attention=attention, annual_sessions=service.settings.annual_sessions)).fit(history)
+                engine.save(service.settings.model_dir)
+            st.session_state.pop("forecast", None)
+            st.rerun()
+    if not artifact:
+        for tab in tabs[:3]:
+            with tab:
+                st.info("مدل ذخیره‌شده‌ای موجود نیست؛ در مدیریت مدل آموزش را اجرا کنید.")
         return
-    selected = st.selectbox("نسخه مدل", versions, format_func=lambda path: path.parent.name)
-    model = ForecastEngine.load(selected.parent)
-    cols = st.columns(4)
-    horizon = cols[0].number_input(
-        "افق پیش‌بینی (۱ روز، ۵ هفته، ۲۱ ماه)", 1, model.config.horizon, model.config.horizon
-    )
-    confidence = cols[1].slider("سطح بازه پیش‌بینی", 0.50, 0.99, 0.90)
-    simulations = cols[2].number_input("تعداد مسیر", 100, 50000, 2000, step=100)
-    vol_scale = cols[3].slider("ضریب سناریوی نوسان", 0.25, 3.0, 1.0)
-    target = (
-        st.number_input("قیمت هدف (واحد نمایش)", min_value=0.01, value=float(history.close.iloc[-1] / unit))
-        * unit
-    )
-    if st.button("تولید توزیع پیش‌بینی"):
-        with st.spinner("نمونه‌گیری از مدل و خطاهای کالیبراسیون…"):
-            st.session_state["forecast"] = model.predict(
-                history, horizon, simulations, vol_scale, service.calendar
-            )
-    forecast = st.session_state.get("forecast")
-    if forecast is None or forecast.metadata["instrument_id"] != identifier:
-        return
-    st.caption(
-        f"نسخه نتیجه: {forecast.metadata['version']} | تولید: {forecast.metadata['generated_at']} | "
-        f"برش داده: {forecast.metadata['input_data_cutoff']} | افق: {forecast.metadata['horizon']} جلسه"
-    )
-    st.info("تاریخ جلسات آینده برآوردی است؛ تعطیلات باید در فایل تقویم ثبت شوند. مسیرها سناریوهای مدل هستند.")
-    if model.metadata["version"] != forecast.metadata["version"]:
-        st.warning("نتیجه نمایش‌داده‌شده متعلق به نسخه قبلی است؛ برای نسخه انتخابی دوباره تولید کنید.")
+    with tabs[1]:
+        learning_curve(artifact, selected.parent)
+    with tabs[2]:
+        model_evaluation(service, symbol, artifact, horizon, selected.parent)
+    with tabs[0]:
+        cols = st.columns(3)
+        confidence = cols[0].slider("سطح بازه پیش‌بینی", 0.50, 0.99, 0.90)
+        simulations = cols[1].number_input("تعداد مسیر", 100, 50000, 2000, step=100)
+        vol_scale = cols[2].slider("ضریب سناریوی نوسان", 0.25, 3.0, 1.0)
+        target = st.number_input("قیمت هدف (واحد نمایش)", min_value=.01,
+                                 value=float(history.close.iloc[-1] / unit)) * unit
+        if st.button("تولید توزیع پیش‌بینی"):
+            with st.spinner("بارگذاری وزن‌های نسخه انتخابی و تولید سناریوهای مدل…"):
+                engine = ForecastEngine.load(selected.parent)
+                st.session_state["forecast"] = engine.predict(history, horizon, simulations, vol_scale, service.calendar)
+        forecast = st.session_state.get("forecast")
+        if forecast is not None and (forecast.metadata["instrument_id"] != identifier or
+            forecast.metadata["version"] != artifact["metadata"]["version"] or forecast.metadata["horizon"] != horizon or
+            forecast.metadata["input_data_cutoff"] != str(history.trading_date.iloc[-1])):
+            forecast = None
+        saved = service.settings.data_dir / "forecasts" / f"{identifier}_{horizon}.xlsx"
+        if forecast is None and saved.exists():
+            stored = Forecast.from_excel(saved)
+            if (stored.metadata["version"] == artifact["metadata"]["version"] and
+                    str(stored.metadata["input_data_cutoff"]) == str(history.trading_date.iloc[-1])):
+                forecast = stored
+                st.session_state["forecast"] = stored
+        if forecast is None:
+            st.info("برای این نسخه و افق خروجی مطابق آخرین داده موجود نیست؛ تولید توزیع پیش‌بینی را انتخاب کنید.")
+            return
+        if forecast.metadata.get("model_stale"):
+            st.warning("خروجی مدل قدیمی است؛ وضعیت بازآموزی را بررسی کنید.")
+        st.caption(f"تولید: {forecast.metadata['generated_at']} | نسخه: {forecast.metadata['version']} | "
+                   f"برش داده: {forecast.metadata['input_data_cutoff']} | افق: {horizon} جلسه")
+        st.info("نمودار آینده پیش‌بینی مدل است؛ تاریخ جلسات آینده تا تأیید کامل تقویم برآوردی است.")
+        forecast_outputs(history, forecast, confidence, target, unit, service.settings.annual_sessions)
+
+
+def forecast_outputs(history, forecast, confidence, target, unit, annual_sessions):
     summary = forecast.summary(confidence, target)
     figure = go.Figure()
     figure.add_scatter(
         x=history.trading_date.tail(100),
         y=history.close.tail(100) / unit,
         name="قیمت مشاهده‌شده",
-        line_color="#183b56",
+        line_color="#7daeff",
     )
     figure.add_scatter(x=summary.date, y=summary.upper / unit, name="حد بالا", line_width=0)
     figure.add_scatter(
@@ -342,15 +423,15 @@ def forecast_page(service, symbol, unit):
     figure.add_scatter(x=summary.date, y=summary.expected / unit, name="امید قیمت", line_color="#00a58b")
     figure.add_scatter(x=summary.date, y=summary["median"] / unit, name="میانه", line_dash="dash")
     chart(figure, "forecast_fan")
-    tabs = st.tabs(["مسیرها", "چگالی و توزیع تجمعی", "بازده و نوسان", "ارزیابی خارج از نمونه"])
-    with tabs[0]:
+
+    with st.expander("مسیرهای مونت‌کارلو"):
         figure = go.Figure()
         for path in forecast.paths[:100]:
             figure.add_scatter(
                 x=forecast.dates, y=path / unit, line={"width": 0.6}, opacity=0.25, showlegend=False
             )
         chart(figure, "forecast_paths")
-    with tabs[1]:
+    with st.expander("توزیع قیمت آینده و احتمال تجمعی"):
         terminal = forecast.paths[:, -1] / unit
         figure = px.histogram(
             x=terminal, nbins=60, histnorm="probability density", title="چگالی قیمت پایانی شبیه‌سازی"
@@ -366,7 +447,7 @@ def forecast_page(service, symbol, unit):
             ),
             "terminal_cdf",
         )
-    with tabs[2]:
+    with st.expander("توزیع بازده و نوسان"):
         chart(
             px.histogram(
                 x=100 * (forecast.paths[:, -1] / forecast.metadata["spot"] - 1),
@@ -375,7 +456,7 @@ def forecast_page(service, symbol, unit):
             ),
             "return_histogram",
         )
-        historical = engineer_features(history, service.settings.annual_sessions)
+        historical = engineer_features(history, annual_sessions)
         figure = go.Figure(
             go.Scatter(
                 x=historical.trading_date.tail(100),
@@ -386,31 +467,11 @@ def forecast_page(service, symbol, unit):
         figure.add_scatter(
             x=summary.date,
             y=summary.cumulative_log_return_std
-            * np.sqrt(service.settings.annual_sessions / np.arange(1, len(summary) + 1)),
+            * np.sqrt(annual_sessions / np.arange(1, len(summary) + 1)),
             name="نوسان ضمنی توزیع پیش‌بینی سالانه",
         )
         chart(figure, "forecast_volatility")
         st.caption("خطای باقیمانده شامل نوآوری بازار و خطای مدل است؛ سهم dropout فقط تقریب عدم‌قطعیت مدل است.")
-    with tabs[3]:
-        evaluated_model = ForecastEngine.load(
-            service.settings.model_dir / identifier / forecast.metadata["version"]
-        )
-        show_table(evaluated_model.metrics)
-        st.caption("خطاها در واحد قیمت مبنای آموزش هستند؛ هیچ برتری بر مدل پایه بدون این نتایج ادعا نمی‌شود.")
-        out = evaluated_model.predictions
-        metric_horizon = st.selectbox("افق گزارش تاریخی", sorted(out.horizon.unique()))
-        out = out[out.horizon.eq(metric_horizon)]
-        chart(
-            px.line(
-                out,
-                x="target_date",
-                y=["actual", "expected", "q05", "q95"],
-                title="مشاهده و پیش‌بینی خارج از نمونه",
-            ),
-            "forecast_oos",
-        )
-        st.json(evaluated_model.distribution_diagnostics)
-        download(evaluated_model.metrics, "model_metrics", "metrics_download")
     show_table(summary, unit)
     st.download_button(
         "دریافت پیش‌بینی و مشخصات — ریال",
@@ -418,6 +479,97 @@ def forecast_page(service, symbol, unit):
         "forecast.xlsx",
         key="forecast_download",
     )
+
+
+
+def learning_curve(artifact, directory):
+    st.subheader("منحنی یادگیری مدل LSTM")
+    losses, metadata = artifact["training"], artifact["metadata"]
+    if losses.empty:
+        st.info("تاریخچه آموزش برای این نسخه موجود نیست.")
+        return
+    best = int(metadata.get("best_epoch", losses.loc[losses.validation_mse.idxmin(), "epoch"]))
+    figure = go.Figure()
+    figure.add_scatter(x=losses.epoch, y=losses.train_mse, name="زیان آموزش", line_color="#54d6b6")
+    figure.add_scatter(x=losses.epoch, y=losses.validation_mse, name="زیان اعتبارسنجی", line_color="#f4bb72")
+    figure.add_vline(x=best, annotation_text="بهترین دوره", line_dash="dash")
+    stopping = metadata.get("early_stopping_epoch")
+    if stopping:
+        figure.add_vline(x=stopping, annotation_text="توقف زودهنگام", line_color="#e989a5")
+    figure.update_layout(xaxis_title="دوره آموزش", yaxis_title="MSE بازده لگاریتمی استاندارد — بدون واحد")
+    chart(figure, "model_learning_curve")
+    cols = st.columns(4)
+    cols[0].metric("دوره‌های انجام‌شده", len(losses))
+    cols[1].metric("بهترین دوره", best)
+    cols[2].metric("کمترین زیان اعتبارسنجی", f"{losses.validation_mse.min():.5f}")
+    cols[3].metric("زیان نهایی آموزش", f"{losses.train_mse.iloc[-1]:.5f}")
+    st.caption("زیان استانداردشده است و خطای قیمت به ریال نیست. وزن‌های ذخیره‌شده مربوط به بهترین اعتبارسنجی هستند.")
+    if metadata.get("partitions"):
+        st.caption("پنجره‌های هر بخش: " + " | ".join(f"{name}: {part['samples']}" for name, part in metadata["partitions"].items()))
+    if metadata.get("training_schema_version"):
+        st.caption("توقف زودهنگام فعال شد." if stopping else "سقف دوره‌های تنظیم‌شده تکمیل شد.")
+    if "learning_rate" in losses:
+        chart(px.line(losses, x="epoch", y="learning_rate", title="تاریخچه واقعی نرخ یادگیری"), "model_learning_rate")
+    else:
+        st.info("نسخه قدیمی تاریخچه نرخ یادگیری را ذخیره نکرده است؛ برای دیدن منحنی‌های موجود نیازی به آموزش مجدد نیست.")
+    st.caption(f"مدت آموزش (ثانیه): {metadata.get('training_duration_seconds', 'ثبت نشده')} | "
+               f"پنجره: {artifact['config']['window']} | batch: {artifact['config']['batch_size']} | "
+               f"لایه‌ها: {artifact['config']['layers']} | hidden: {artifact['config']['hidden_size']}")
+    show_table(losses)
+    path = directory / "training_history.xlsx"
+    if path.exists():
+        st.download_button("دریافت تاریخچه آموزش", path.read_bytes(), "training_history.xlsx", key="training_history_download")
+
+
+def model_evaluation(service, symbol, artifact, horizon, directory):
+    st.subheader("ارزیابی عملکرد مدل")
+    metrics = artifact["metrics"]
+    view = metrics[metrics.horizon.eq(horizon)]
+    st.caption("معیارهای آزمون زمانی؛ MAE، RMSE، CRPS و خطای چندکی در واحد مبنای قیمت آموزش (ریال) هستند. "
+               "دقت جهت و پوشش بین صفر و یک‌اند؛ پوشش بازه ۹۰٪ نزدیک ۰٫۹ مطلوب است.")
+    show_table(view)
+    chart(px.bar(view, x="model", y="rmse", color="model", title="LSTM و مدل‌های پایه — RMSE ریال"), "evaluation_comparison")
+    out = artifact["predictions"]
+    out = out[out.horizon.eq(horizon)]
+    if not out.empty:
+        chart(px.line(out, x="target_date", y=["actual", "expected", "q05", "q95"],
+                      title="قیمت واقعی و پیش‌بینی در مجموعه آزمون"), "forecast_oos")
+    partitions = artifact["metadata"].get("partitions")
+    if partitions:
+        st.markdown("**مرزها و نمونه‌های تقسیم زمانی**")
+        show_table(pd.DataFrame([{"partition": name, **values} for name, values in partitions.items()]))
+    else:
+        metadata = artifact["metadata"]
+        st.caption(f"آخر هدف آموزش: {metadata.get('training_target_end')} | "
+                   f"آخر کالیبراسیون: {metadata.get('calibration_end')} | شروع آزمون: {metadata.get('test_start')}")
+        st.info("تعداد دقیق نمونه هر بخش در این نسخه قدیمی ثبت نشده است.")
+    st.caption("افت نمونه‌ها در مرز بخش‌ها برای حذف هم‌پوشانی اهداف است. مقیاس‌گذار فقط با آموزش برازش شده است.")
+    from .forecasting import load_model_artifacts
+    compare = st.multiselect("مقایسه گزارش‌های ذخیره‌شده نمادها", ["اهرم", "موج", "توان"],
+                            default=[symbol] if symbol in ["اهرم", "موج", "توان"] else [])
+    rows = []
+    for item in compare:
+        history = service.history(item)
+        if history.empty:
+            continue
+        versions = service.models(str(history.instrument_id.iloc[-1]))
+        if versions:
+            report = artifact if item == symbol else load_model_artifacts(versions[0].parent)
+            selected_metrics = report["metrics"][report["metrics"].horizon.eq(horizon)].copy()
+            selected_metrics["symbol"] = item
+            selected_metrics["version"] = report["metadata"]["version"]
+            rows.append(selected_metrics)
+    if rows:
+        st.caption("خطای ریالی نمادهای با سطح قیمت متفاوت قابل رتبه‌بندی مستقیم نیست؛ هر مدل را با پایه همان نماد مقایسه کنید.")
+        show_table(pd.concat(rows, ignore_index=True))
+    with st.expander("تشخیص توزیع باقیمانده و کالیبراسیون"):
+        st.json(artifact.get("distribution_diagnostics", {}))
+    st.download_button("دریافت گزارش کامل ارزیابی", (directory / "evaluation.xlsx").read_bytes(),
+                       "evaluation.xlsx", key="evaluation_report_download")
+    walk_path = service.settings.data_dir / "backtests" / f"forecast_walk_forward_{artifact['metadata']['instrument_id']}.xlsx"
+    if walk_path.exists():
+        with st.expander("نتایج آزمون گام‌به‌گام پیش‌بینی"):
+            show_table(pd.read_excel(walk_path, sheet_name=0))
 
 
 def option_page(service, symbol, unit):
@@ -671,6 +823,22 @@ def strategy_page(service, symbol, unit):
 
 
 def decision_page(service, symbol, unit):
+    history = service.history(symbol) if symbol else pd.DataFrame()
+    previous_forecast = st.session_state.get("forecast")
+    if not history.empty and (previous_forecast is None or
+                             previous_forecast.metadata["instrument_id"] != str(history.instrument_id.iloc[-1])):
+        from .forecasting import Forecast
+        saved = service.settings.data_dir / "forecasts" / f"{history.instrument_id.iloc[-1]}_21.xlsx"
+        if saved.exists():
+            candidate = Forecast.from_excel(saved)
+            if candidate.metadata["input_data_cutoff"] == str(history.trading_date.iloc[-1]):
+                st.session_state["forecast"] = candidate
+    if not history.empty:
+        saved_scenarios = service.settings.data_dir / "options" / f"{history.instrument_id.iloc[-1]}_21.xlsx"
+        if saved_scenarios.exists():
+            with st.expander("آخرین سناریوهای ذخیره‌شده پایپلاین"):
+                st.caption("گزارش ذخیره‌شده است؛ تاریخ داده و مفروضات را بررسی کنید.")
+                show_table(pd.read_excel(saved_scenarios, sheet_name="scenarios__0000"), unit)
     forecast = st.session_state.get("forecast")
     strategies = st.session_state.get("strategies", [])
     if forecast is None or not strategies:
@@ -785,20 +953,14 @@ def backtest_page(service, symbol, unit):
         )
         if st.button("اجرای آزمون پیش‌بینی"):
             with st.spinner("آموزش مجدد در هر برش زمانی…"):
-                st.session_state["walk_forward"] = walk_forward_forecasts(history, config, initial, step)
-        result = st.session_state.get("walk_forward")
-        if result is not None:
-            show_table(result)
-            chart(
-                px.line(
-                    result[result.horizon.eq(horizon)],
-                    x="target_date",
-                    y=["actual", "expected"],
-                    title="نتایج خارج از نمونه",
-                ),
-                "walk_forward",
-            )
-            download(result, "walk_forward", "walk_forward_download")
+                result = walk_forward_forecasts(history, config, initial, step)
+                identifier = str(history.instrument_id.iloc[-1])
+                destination = service.settings.data_dir / "backtests" / f"forecast_walk_forward_{identifier}.xlsx"
+                atomic_bytes(destination, excel_bytes({"predictions": result}))
+                st.session_state["walk_forward"] = result
+                st.session_state["walk_forward_id"] = identifier
+        if st.session_state.get("walk_forward_id") == str(history.instrument_id.iloc[-1]):
+            st.info("گزارش آزمون پیش‌بینی ذخیره شد؛ آن را در صفحه پیش‌بینی، تب ارزیابی عملکرد مدل ببینید.")
         return
     options = service.repository.read("options")
     if options.empty or not {"available_at", "trading_date", "execution_at"} <= set(options):
@@ -878,7 +1040,7 @@ def backtest_page(service, symbol, unit):
         download(result.trades, "backtest_trades", "backtest_download")
 
 
-def data_page(service, symbol, unit):
+def advanced_data_page(service, symbol, unit):
     st.caption(
         "ورود فایل‌های Funds / Details / NAV / Options / PriceHistory / ClientHistory / Metadata؛ فایل اصلی بدون تغییر آرشیو می‌شود."
     )
@@ -890,25 +1052,6 @@ def data_page(service, symbol, unit):
         report = service.import_file(path)
         st.success("ورود داده انجام شد؛ گزارش رکوردهای ناقص را بررسی کنید.")
         st.json(report)
-    include_history = st.checkbox("دریافت تاریخچه کامل قیمت و حقیقی/حقوقی")
-    symbols_text = st.text_input("نمادهای دلخواه با ویرگول؛ خالی برای کشف صندوق‌های اهرمی")
-    key_available = bool(os.environ.get("BRS_API_KEY"))
-    st.write(
-        "BrsApi:",
-        "کلید تنظیم شده؛ دسترسی در زمان درخواست آزموده می‌شود" if key_available else "نیازمند BRS_API_KEY",
-    )
-    if st.button("به‌روزرسانی یک‌کلیکی", disabled=not key_available):
-        with st.spinner("دریافت و ثبت اتمی مشاهدات…"):
-            symbols = [s.strip() for s in symbols_text.replace("،", ",").split(",") if s.strip()]
-            report = service.update(include_history, tickers=symbols or None)
-        st.json(report)
-        st.success("به‌روزرسانی پایان یافت. برای مشاهده نمادهای جدید صفحه را بازخوانی کنید.")
-    status = service.settings.data_dir / "processed" / "last_update.json"
-    if status.exists():
-        st.json(json.loads(status.read_text(encoding="utf-8")))
-    st.info(
-        "TSETMC مستقیم از این محیط تأیید نشد و فعال نیست. قرارداد یا تاریخ ناموجود حدس زده نمی‌شود. دریافت مستقیم گزارش‌های کدال در این نسخه فعال نیست."
-    )
     tables = service.repository.read_all()
     show_table(
         pd.DataFrame(
@@ -990,40 +1133,208 @@ def data_page(service, symbol, unit):
             st.code("\n".join(log.read_text(encoding="utf-8").splitlines()[-30:]), language="json")
 
 
-def main():
-    st.set_page_config(page_title="سامانه تصمیم‌یار بازار ایران", page_icon="📊", layout="wide")
-    st.markdown(
-        """<style>
-        .stApp {direction:rtl;font-family:Tahoma,Arial,sans-serif;}
-        [data-testid="stSidebar"] {direction:rtl;background:#f3f6fa;}
-        h1,h2,h3,p,label {font-family:Tahoma,Arial,sans-serif!important;}
-        [data-testid="stMetric"] {background:#f3f6fa;padding:1rem;border-radius:10px;}
-        [data-testid="stDataFrame"],.js-plotly-plot,pre,code {direction:ltr;}
-        </style>""",
-        unsafe_allow_html=True,
-    )
+
+
+
+def pipeline_controls(service, symbols_text):
+    from .pipeline import MarketPipelineService
+    from filelock import Timeout
+
+    st.subheader("اجرای پایپلاین")
+    st.caption("تاریخچه بدون کلید ← اکسل ← ویژگی‌ها ← آموزش خودکار / بارگذاری مدل ← پیش‌بینی ← اختیار")
+    refresh = st.checkbox("بازآموزی اجباری مدل‌ها (زمان‌بر)", key="pipeline_retrain")
+    full, data_only, inference = st.columns(3)
+    run_full = full.button("اجرای کامل پایپلاین", key="run_full_pipeline", type="primary")
+    run_data = data_only.button("دریافت تمام داده‌های تاریخی", key="run_data_only")
+    run_inference = inference.button("فقط اجرای پیش‌بینی", key="run_inference")
+    live_col, train_col = st.columns(2)
+    run_live = live_col.button("به‌روزرسانی داده جاری", key="run_live_only")
+    run_train = train_col.button("آموزش مجدد مدل‌ها", key="run_train_only")
+    if run_full or run_data or run_inference or run_live or run_train:
+        progress, current, table = st.progress(0), st.empty(), st.empty()
+        def update(run):
+            stages = run["stages"]
+            progress.progress(min(.95, len(stages) / (8 + len(stages))), text=stages[-1]["name"])
+            current.caption(f"زمان: {run['elapsed_seconds']} ثانیه | " + " | ".join(
+                f"{LABELS.get(k, k)}: {v}" for k, v in run["counts"].items()))
+            table.dataframe(pd.DataFrame(stages), hide_index=True, width="stretch")
+        try:
+            symbols = [s.strip() for s in symbols_text.replace("،", ",").split(",") if s.strip()]
+            report = MarketPipelineService(service).run_full_pipeline(
+                symbols or None, historical_backfill="auto" if run_full or run_data else "never",
+                update_live=bool(run_full or run_live), update_forecasts=not (run_data or run_live),
+                retrain_policy="always" if refresh or run_train else "auto", progress_callback=update)
+            st.session_state["pipeline_report"] = report
+            for key in ("forecast", "quality_report", "walk_forward", "option_backtest", "strategy"):
+                st.session_state.pop(key, None)
+            st.cache_data.clear()
+            st.rerun()
+        except Timeout:
+            st.warning("اجرای دیگری فعال است؛ تا پایان آن صبر کنید.")
+    path = service.settings.data_dir / "processed" / "last_pipeline.json"
+    if path.exists():
+        report = json.loads(path.read_text(encoding="utf-8"))
+        st.write(f"آخرین اجرا: {report['status']} | شناسه: {report['run_id']}")
+        show_table(pd.DataFrame([report["counts"]]))
+        show_table(pd.DataFrame(report["stages"]))
+        collection = report.get("collection", {})
+        if collection:
+            st.caption(f"منبع snapshot این اجرا: {collection.get('provider', 'نامشخص')}")
+            if collection.get("warnings"):
+                with st.expander("هشدارهای اتصال داده جاری"):
+                    show_table(pd.DataFrame(collection["warnings"]))
+            if collection.get("limitations"):
+                st.info(collection["limitations"])
+        st.download_button("دریافت گزارش اجرای پایپلاین", path.read_bytes(), "pipeline.json")
+
+
+def data_page(service, symbol, unit):
+    from .credentials import CredentialStore
+    from .historical import TsetmcProvider, HistoricalAPIError
+    st.subheader("تنظیمات و اطلاعات داده‌ها")
+    st.markdown("**اتصالات داده**")
+    st.info("تاریخچه TSETMC عمومی است و به کلید نیاز ندارد. کلید BrsApi فقط برای داده زنده و جایگزین اختیاری است.")
+    symbols_text = st.text_input("نمادهای پایپلاین با ویرگول", value=service.settings.default_symbols,
+                                  key="pipeline_symbols")
+    if st.button("آزمون اتصال تاریخچه — بدون کلید"):
+        try:
+            selected = symbols_text.replace("،", ",").split(",")[0].strip()
+            provider = TsetmcProvider(service.settings.data_dir)
+            identity = provider.resolve(selected)
+            provider.request(f"Instrument/GetInstrumentInfo/{identity['instrument_id']}", "instrumentInfo")
+            result = {"status": "SUCCESS", "tested_at": pd.Timestamp.now(tz="UTC").isoformat(), **identity}
+            st.success(f"اتصال و هویت نماد تأیید شد: {identity['symbol']}")
+        except HistoricalAPIError as exc:
+            result = {"status": "FAILED", "message": str(exc)}
+            st.warning(str(exc))
+        atomic_bytes(service.settings.data_dir / "processed/historical_connection.json",
+                     json.dumps(result, ensure_ascii=False).encode("utf-8"))
+    with st.form("live_key_configuration", clear_on_submit=True):
+        entered = st.text_input("کلید API بازار زنده BrsApi", type="password", key="new_live_api_key")
+        save = st.form_submit_button("ذخیره امن تنظیمات")
+        if save:
+            try:
+                CredentialStore(service.settings.data_dir).save(entered)
+                st.success("کلید به‌صورت رمز‌شده برای حساب ویندوز ذخیره شد.")
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+    key_available = bool(service.live_key())
+    st.caption("BrsApi: کلید تنظیم شده" if key_available else "BrsApi: کلید زنده تنظیم نشده؛ تاریخچه همچنان قابل دریافت است.")
+    from .credentials import CredentialStore
+    credential_status = CredentialStore(service.settings.data_dir).status()
+    if credential_status.get("message"):
+        st.warning(credential_status["message"])
+    if st.button("آزمون اتصال بازار زنده", disabled=not key_available):
+        try:
+            report = service.test_live_connection()
+            if report["status"] == "SUCCESS":
+                st.success("اتصال و ساختار پاسخ تأیید شد؛ تازگی هر endpoint را در جدول بررسی کنید.")
+            else:
+                st.warning("اتصال بازار زنده تأیید نشد؛ علت در گزارش اتصال ثبت شده است.")
+        except Exception as exc:
+            from leveraged_funds_collector import MarketDataError
+            message = str(exc) if isinstance(exc, MarketDataError) else "اتصال تأیید نشد؛ کلید، مجوز سرویس و شبکه را بررسی کنید."
+            status_path = service.settings.data_dir / "processed/live_connection.json"
+            previous = json.loads(status_path.read_text("utf-8")) if status_path.exists() else {}
+            previous.update(status="FAILED", message=message, last_attempt_at=pd.Timestamp.now(tz="UTC").isoformat())
+            atomic_bytes(status_path, json.dumps(previous, ensure_ascii=False).encode("utf-8"))
+            st.warning(message)
+    if st.button("بررسی اتصال داده جاری", key="diagnose_live"):
+        from .live import diagnose_market_api
+        symbols = [item.strip() for item in symbols_text.replace("،", ",").split(",") if item.strip()]
+        results = diagnose_market_api("BrsApi", service.live_key(), symbols=symbols,
+                                     max_age_hours=service.settings.live_max_age_hours)
+        results += diagnose_market_api("TSETMC", symbols=symbols, data_dir=service.settings.data_dir,
+                                      max_age_hours=service.settings.live_max_age_hours)
+        atomic_bytes(service.settings.data_dir / "processed/live_diagnostics.json",
+                     json.dumps(results, ensure_ascii=False).encode("utf-8"))
+    diagnostic = service.settings.data_dir / "processed/live_diagnostics.json"
+    if diagnostic.exists():
+        st.markdown("**وضعیت API داده جاری**")
+        show_table(pd.DataFrame(json.loads(diagnostic.read_text("utf-8"))))
+    from .ui import typography_status
+    st.caption(typography_status())
+    for filename, label in (("historical_connection.json", "وضعیت اتصال تاریخچه"),
+                            ("live_connection.json", "آخرین اتصال موفق بازار زنده")):
+        path = service.settings.data_dir / "processed" / filename
+        if path.exists():
+            with st.expander(label):
+                st.json(json.loads(path.read_text("utf-8")))
+    st.divider()
+    pipeline_controls(service, symbols_text)
+    st.divider()
+    st.subheader("وضعیت داده‌ها")
+    coverage = service.coverage()
+    show_table(coverage)
+    download(coverage, "historical_coverage", "coverage_download")
+    st.caption("شکاف جلسات برآوردی شامل تعطیلات تأییدنشده و توقف نماد هم می‌شود؛ تاریخچه به‌صورت مصنوعی پر نمی‌شود.")
+    with st.expander("علت حذف رکوردهای API و محدودیت‌های داده"):
+        removed = []
+        for identifier in coverage.get("instrument_id", pd.Series(dtype=str)).dropna():
+            path = service.settings.data_dir / "processed" / f"history_{identifier}.json"
+            if path.exists():
+                report = json.loads(path.read_text("utf-8"))
+                issues = pd.DataFrame(report.get("issues", []))
+                if not issues.empty:
+                    issues["symbol"] = report["symbol"]
+                    removed.append(issues)
+        if removed:
+            show_table(pd.concat(removed, ignore_index=True))
+    tables = service.repository.read_all()
+    prices = tables.get("prices", pd.DataFrame())
+    if prices.empty:
+        st.info("داده تاریخی موجود نیست. برای دریافت خودکار اطلاعات و آماده‌سازی مدل، اجرای کامل پایپلاین را انتخاب کنید.")
+    else:
+        cols = st.columns(4)
+        cols[0].metric("مشاهدات تاریخی", f"{len(prices):,}")
+        cols[1].metric("نمادهای تحت پوشش", prices.instrument_id.nunique())
+        cols[2].metric("ابتدای تاریخچه", jalali(prices.trading_date.min()))
+        cols[3].metric("آخرین معامله تاریخی", jalali(prices.trading_date.max()))
+        st.caption(f"آخرین دریافت تاریخچه: {prices.retrieved_at.max()}")
+    snapshots = tables.get("snapshots", pd.DataFrame())
+    if not snapshots.empty:
+        st.caption(f"آخرین دریافت snapshot زنده: {snapshots.retrieved_at.max()}؛ زمان دریافت، زمان معامله نیست.")
+    versions = list(service.settings.model_dir.glob("*/*/model.json"))
+    st.caption(f"نسخه‌های آموزش‌دیده: {len(versions)} | پایگاه: {service.repository.path}")
+    results = list((service.settings.data_dir / "forecasts").glob("*.xlsx"))
+    if results:
+        st.caption(f"فایل‌های پیش‌بینی: {len(results)} | آخرین ثبت: " +
+                   str(pd.Timestamp(max(p.stat().st_mtime for p in results), unit="s", tz="UTC")))
+    with st.expander("ابزارهای پیشرفته: بازیابی اکسل، کنترل کیفیت و خروجی"):
+        advanced_data_page(service, symbol, unit)
+
+
+PAGE_PATHS = ["market", "forecast", "options", "strategy", "decision", "backtest", "settings"]
+
+
+def render_page(index):
+    from .ui import shell
     service = MarketService()
-    st.sidebar.title("تصمیم‌یار بازار ایران")
-    page = st.sidebar.radio("بخش سامانه", PAGES)
-    instruments = service.instruments()
-    symbol = (
-        st.sidebar.selectbox("نماد", sorted(instruments.symbol.unique())) if not instruments.empty else None
-    )
-    unit_name = st.sidebar.radio("واحد نمایش مبالغ", ["ریال", "تومان"], horizontal=True)
-    unit = 10 if unit_name == "تومان" else 1
-    st.sidebar.caption("هر تومان = ۱۰ ریال. ذخیره‌سازی و ورودی کارمزد/سرمایه همواره ریال است.")
-    st.title(page)
-    st.caption("مشاهدات واقعی، پیش‌بینی خارج از نمونه و سناریوهای مدل با برچسب جداگانه نمایش داده می‌شوند.")
-    pages = dict(
-        zip(
-            PAGES,
-            [market_page, forecast_page, option_page, strategy_page, decision_page, backtest_page, data_page],
-        )
-    )
+    symbol = st.session_state.get("selected_symbol")
+    unit = 10 if st.session_state.get("display_unit") == "تومان" else 1
+    shell(PAGES[index])
     try:
-        pages[page](service, symbol, unit)
+        [market_page, forecast_page, option_page, strategy_page, decision_page, backtest_page, data_page][index](service, symbol, unit)
     except (ValueError, FileNotFoundError, PermissionError) as exc:
         st.error(str(exc))
     except Exception as exc:
-        # Never echo networking exceptions/credentials into the UI.
-        st.error(f"عملیات انجام نشد ({type(exc).__name__}). گزارش خطا و دسترسی فایل/شبکه را بررسی کنید.")
+        st.error(f"عملیات انجام نشد ({type(exc).__name__}). گزارش اجرا را بررسی کنید.")
+
+
+def main():
+    from pathlib import Path
+    st.set_page_config(page_title="سامانه تصمیم‌یار بازار ایران", page_icon="📊", layout="wide")
+    service = MarketService()
+    st.sidebar.title("فیلترهای تحلیل")
+    instruments = service.instruments()
+    choices = sorted(instruments.symbol.unique()) if not instruments.empty else [
+        s.strip() for s in service.settings.default_symbols.split(",") if s.strip()]
+    if st.session_state.get("selected_symbol") not in choices:
+        st.session_state["selected_symbol"] = choices[0] if choices else None
+    if choices:
+        st.sidebar.selectbox("نماد", choices, key="selected_symbol")
+    st.sidebar.radio("واحد نمایش مبالغ", ["ریال", "تومان"], horizontal=True, key="display_unit")
+    st.sidebar.caption("هر تومان = ۱۰ ریال؛ ذخیره‌سازی و ورودی سرمایه همواره ریال است.")
+    pages = [st.Page(str(Path(__file__).parent / "pages" / f"{slug}.py"), title=title,
+                     url_path=slug, default=i == 0) for i, (slug, title) in enumerate(zip(PAGE_PATHS, PAGES))]
+    st.navigation(pages, position="top").run()

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 
 import numpy as np
@@ -20,9 +21,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .calendar import TradingCalendar, utc_timestamp
-from .features import MODEL_FEATURES, engineer_features
+from .calendar import TradingCalendar, parse_date, utc_timestamp
+from .features import prepare_model_frame
 from .storage import atomic_bytes, excel_bytes
+
+
+TRAINING_SCHEMA_VERSION = 2
 
 
 class InsufficientData(ValueError):
@@ -37,6 +41,9 @@ class ModelConfig(BaseModel):
     dropout: float = Field(default=0.15, gt=0, lt=1)
     attention: bool = False
     learning_rate: float = Field(default=0.001, gt=0)
+    weight_decay: float = Field(default=0.0001, ge=0)
+    lr_patience: int = Field(default=3, ge=1)
+    lr_factor: float = Field(default=0.5, gt=0, lt=1)
     epochs: int = Field(default=60, ge=1)
     patience: int = Field(default=8, ge=1)
     batch_size: int = Field(default=32, ge=1)
@@ -126,6 +133,8 @@ class Forecast:
             "date": [str(d) for d in self.dates],
             "expected": self.paths.mean(axis=0),
             "median": np.median(self.paths, axis=0),
+            "expected_return_pct": 100 * (self.paths.mean(axis=0) / spot - 1),
+            "median_return_pct": 100 * (np.median(self.paths, axis=0) / spot - 1),
             "lower": np.quantile(self.paths, lower, axis=0),
             "upper": np.quantile(self.paths, upper, axis=0),
             "probability_up": (self.paths > spot).mean(axis=0),
@@ -151,6 +160,19 @@ class Forecast:
             ),
         )
 
+    @classmethod
+    def from_excel(cls, path):
+        reports = pd.read_excel(path, sheet_name=None, dtype={"instrument_id": str})
+        metadata = reports["metadata__0000"].iloc[0].to_dict()
+        metadata["instrument_id"] = str(metadata["instrument_id"])
+        summary = reports["forecast__0000"]
+        paths_frame = reports["paths__0000"]
+        paths = paths_frame.iloc[:, 1:].to_numpy(dtype=float).T
+        if paths.shape[1] != len(summary) or not np.isfinite(paths).all() or (paths <= 0).any():
+            raise ValueError("Invalid persisted forecast paths")
+        return cls(paths, [parse_date(d) for d in summary.date], metadata,
+                   summary.epistemic_log_return_std.to_numpy(dtype=float))
+
 
 class ForecastEngine:
     def __init__(self, config=None):
@@ -167,19 +189,10 @@ class ForecastEngine:
         torch.use_deterministic_algorithms(True, warn_only=True)
 
     def _prepare(self, history):
-        frame = engineer_features(history, self.config.annual_sessions)
-        features = getattr(self, "feature_names", None)
-        if features is None:
-            features = [f for f in MODEL_FEATURES if f != "volume_change" or frame[f].notna().sum() > 30]
-        ready = frame.dropna(subset=features).reset_index(drop=True)
-        # Interior missing features must not silently turn several sessions into one.
-        if len(ready) and len(ready) != len(frame) - int(
-            frame.index[frame.trading_date.eq(ready.trading_date.iloc[0])][0]
-        ):
-            raise ValueError("Interior missing feature observations; repair source data before training")
-        return ready, features
+        return prepare_model_frame(history, self.config.annual_sessions, getattr(self, "feature_names", None))
 
     def fit(self, history):
+        started = monotonic()
         self._seed()
         frame, self.feature_names = self._prepare(history)
         c = self.config
@@ -199,25 +212,31 @@ class ForecastEngine:
         train_x, train_y = tensors(groups["train"])
         val_x, val_y = tensors(groups["validation"])
         self.model = ReturnLSTM(len(self.feature_names), c).to(c.device)
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=c.learning_rate)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=c.learning_rate, weight_decay=c.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=c.lr_factor, patience=c.lr_patience, min_lr=1e-6)
         loader = DataLoader(TensorDataset(train_x, train_y), batch_size=c.batch_size, shuffle=False)
         best_loss, best_state, stale, losses = float("inf"), None, 0, []
         for epoch in range(c.epochs):
             self.model.train()
-            train_losses = []
+            train_loss_sum, train_count = 0.0, 0
+            epoch_lr = optimizer.param_groups[0]["lr"]
             for x, y in loader:
                 optimizer.zero_grad()
                 loss = nn.functional.mse_loss(self.model(x.to(c.device)), y.to(c.device))
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
-                train_losses.append(loss.item())
+                train_loss_sum += loss.item() * len(x)
+                train_count += len(x)
             self.model.eval()
             with torch.no_grad():
                 val_loss = nn.functional.mse_loss(self.model(val_x.to(c.device)), val_y.to(c.device)).item()
             losses.append(
-                {"epoch": epoch + 1, "train_mse": float(np.mean(train_losses)), "validation_mse": val_loss}
+                {"epoch": epoch + 1, "train_mse": train_loss_sum / train_count,
+                 "validation_mse": val_loss, "learning_rate": epoch_lr}
             )
+            scheduler.step(val_loss)
             if val_loss < best_loss:
                 best_loss = val_loss
                 best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
@@ -226,6 +245,7 @@ class ForecastEngine:
                 stale += 1
             if stale >= c.patience:
                 break
+        training_duration = monotonic() - started
         self.model.load_state_dict(best_state)
         cal_x, cal_y = tensors(groups["calibration"])
         self.model.eval()
@@ -252,6 +272,23 @@ class ForecastEngine:
             "uncertainty_method": "MC dropout + held-out empirical residual vectors",
             "residual_vectors": len(self.residuals),
             "test_status": "out_of_sample_chronological",
+            "training_schema_version": TRAINING_SCHEMA_VERSION,
+            "input_observations": len(history), "eligible_feature_rows": len(frame),
+            "preprocessing_removed": len(history) - len(frame),
+            "best_epoch": int(np.argmin([row["validation_mse"] for row in losses])) + 1,
+            "epochs_completed": len(losses), "best_validation_loss": best_loss,
+            "early_stopping_epoch": len(losses) if len(losses) < c.epochs else None,
+            "training_duration_seconds": training_duration,
+            "loss_description": "MSE on standardized future log returns; dimensionless, not rial",
+            "partitions": {
+                name: {"start": str(frame.trading_date.iloc[start]),
+                       "end": str(frame.trading_date.iloc[end - 1]),
+                       "observations": end - start, "samples": len(groups[name]),
+                       "observation_pct": 100 * (end - start) / len(frame),
+                       "first_target": str(frame.trading_date.iloc[groups[name][0] + 1]),
+                       "last_target": str(frame.trading_date.iloc[groups[name][-1] + c.horizon])}
+                for name, start, end in zip(groups, [0, *boundaries[:-1]], boundaries)
+            },
         }
         flat = self.residuals.ravel()
         normal_parameters = stats.norm.fit(flat)
@@ -323,6 +360,7 @@ class ForecastEngine:
             pd.DataFrame(predictions),
             pd.DataFrame(losses),
         )
+        self.metadata["fit_duration_seconds"] = monotonic() - started
         return self
 
     def predict(
@@ -411,6 +449,8 @@ class ForecastEngine:
             directory / "evaluation.xlsx",
             excel_bytes({"metrics": self.metrics, "predictions": self.predictions, "training": self.losses}),
         )
+        atomic_bytes(directory / "training_history.xlsx", excel_bytes({"training_history": self.losses.rename(
+            columns={"train_mse": "train_loss", "validation_mse": "validation_loss"})}))
         # Publish the discovery marker last; incomplete directories never appear as loadable versions.
         atomic_bytes(directory / "model.json", json.dumps(info, ensure_ascii=False, indent=2).encode("utf-8"))
         return directory
@@ -465,3 +505,17 @@ def walk_forward_forecasts(history, config, initial=300, step=21, simulations=20
     if not records:
         raise InsufficientData("No complete walk-forward folds")
     return pd.DataFrame(records)
+
+
+def load_model_artifacts(directory):
+    """Read durable reports/metadata only; no checkpoint loading or model inference."""
+    directory = Path(directory)
+    info = json.loads((directory / "model.json").read_text(encoding="utf-8"))
+    reports = pd.read_excel(directory / "evaluation.xlsx", sheet_name=None)
+    losses = reports.get("training__0000", pd.DataFrame())
+    history_path = directory / "training_history.xlsx"
+    if history_path.exists():
+        losses = pd.read_excel(history_path, sheet_name=0).rename(
+            columns={"train_loss": "train_mse", "validation_loss": "validation_mse"})
+    return {**info, "metrics": reports["metrics__0000"],
+            "predictions": reports["predictions__0000"], "training": losses}

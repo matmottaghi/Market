@@ -224,3 +224,9 @@ data/
 models/
 *.lock
 .streamlit/cache/
+docs/
+# Encrypted local credentials
+.secrets/
+*.dpapi
+
+.secrets-*/

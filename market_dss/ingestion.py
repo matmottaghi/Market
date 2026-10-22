@@ -45,6 +45,7 @@ class ImportBatch:
     tables: dict[str, pd.DataFrame]
     issues: list[dict] = field(default_factory=list)
     raw_path: Path | None = None
+    stats: dict = field(default_factory=dict)
 
 
 class DataProvider(ABC):
@@ -218,13 +219,14 @@ class ExcelProvider(DataProvider):
 class BrsApiProvider(DataProvider):
     name = "BrsApi"
 
-    def __init__(self, output_dir, tickers=None):
+    def __init__(self, output_dir, tickers=None, api_key=None):
         self.output_dir, self.tickers = Path(output_dir), tickers
+        self.api_key = api_key
 
     def fetch(self, include_history=False):
         from leveraged_funds_collector import LeveragedFundsCollector
 
-        kwargs = {"output_dir": self.output_dir}
+        kwargs = {"output_dir": self.output_dir, "api_key": self.api_key}
         if self.tickers:
             kwargs.update(tickers=self.tickers, discover_new_funds=False)
         collector = LeveragedFundsCollector(**kwargs)
@@ -239,11 +241,12 @@ def update_market_data(repository: ExcelRepository, provider: DataProvider, raw_
     batch = provider.fetch(include_history=include_history)
     if batch.raw_path:
         repository.archive_file(batch.raw_path, raw_dir)
-    if not batch.tables:
+    if not any(not frame.empty for frame in batch.tables.values()):
         raise ValueError("No valid records; historical database unchanged")
     counts = repository.upsert_many(batch.tables)
     LOGGER.info("update_complete provider=%s counts=%s issues=%s", provider.name, counts, len(batch.issues))
-    return {"counts": counts, "issues": batch.issues, "retrieved_at": utc_timestamp()}
+    return {"provider": provider.name, "counts": counts, "incoming_counts": {k: len(v) for k, v in batch.tables.items()},
+            "issues": batch.issues, "retrieved_at": utc_timestamp()}
 
 
 def numeric_frame(frame):
