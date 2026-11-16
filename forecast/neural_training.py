@@ -1,5 +1,5 @@
 # توضیح فایل: اجرای آموزش واقعی LSTM، ثبت منحنی هر epoch، کالیبراسیون مستقل و ذخیرهٔ مدل و دادهٔ آماده.
-# توابع: decode تبدیل خروجی شبکه به پارامتر بازده؛ train_symbol آموزش یک نماد با سه افق؛
+# توابع: decode تبدیل خروجی شبکه به پارامتر بازده؛ train_symbol آموزش مستقیم ساعت‌های ۲۱ جلسه؛
 # run_neural_pipeline هماهنگی دریافت، ثبت وضعیت و آموزش نمادهای انتخابی؛ EpochRecorder.on_epoch_end ثبت زندهٔ منحنی‌ها.
 # row_without_epoch مقادیر عددی منحنی را برای ذخیرهٔ پیشرفت از شمارهٔ epoch جدا می‌کند؛ update وضعیت اتمیک اجرا را ثبت می‌کند.
 from dataclasses import replace
@@ -17,9 +17,11 @@ from filelock import FileLock
 from scipy.special import ndtr
 
 from market_data import Settings, CsvMarketStore, TsetmcClient, sync_market
+from market_data.sqlite_store import make_store
 from market_data.csv_store import _write_bytes_atomic, _csv_atomic
 from .pipeline import BASE, RUNS, save_status
 from .registry import instruments, prune, list_runs
+from .hourly_data import prepare_hourly_sequences, scale_hourly, STEPS, clean_context
 from .neural_data import prepare_sequences, chronological_splits, scale_sequences, price_distribution, HORIZONS, FEATURE_NAMES
 
 
@@ -27,20 +29,21 @@ def decode(raw, target_scale, calibration=None):
     raw = np.asarray(raw)
     if not np.isfinite(raw).all():
         raise ValueError('Network produced non-finite parameters')
-    mu = raw[:, :3]*target_scale
-    sigma = (np.logaddexp(0, raw[:, 3:])+.05)*target_scale
+    count=len(target_scale)
+    mu = raw[:, :count]*target_scale
+    sigma = (np.logaddexp(0, raw[:, count:])+.05)*target_scale
     if calibration is not None:
         sigma *= calibration
     return mu, np.maximum(sigma, 1e-6)
 
 
-def train_symbol(hourly, daily, symbol, code, folder, epochs, update):
+def train_symbol(hourly, daily, symbol, code, folder, epochs, update, context_frames=()):
     import keras
     from .neural_network import build_network
     keras.backend.clear_session()
-    x, mask, y, metadata, latest_x, latest_mask, latest_info = prepare_sequences(hourly, daily)
+    x, mask, y, metadata, latest_x, latest_mask, latest_info = prepare_hourly_sequences(hourly, daily, context_frames)
     splits = chronological_splits(metadata)
-    xs, latest_scaled, ys, scaling = scale_sequences(x, mask, latest_x, latest_mask, y, splits)
+    xs, latest_scaled, ys, scaling = scale_hourly(x, mask, latest_x, latest_mask, y, splits)
     metadata['split'] = 'purged'
     for name, indices in splits.items():
         metadata.loc[indices, 'split'] = name
@@ -48,8 +51,8 @@ def train_symbol(hourly, daily, symbol, code, folder, epochs, update):
     np.savez_compressed(folder / f'{code}_prepared.npz', x=x, mask=mask, y_log_return=y,
                         latest_x=latest_x, latest_mask=latest_mask, **splits)
     _csv_atomic(hourly, folder / f'{code}_hourly_dataset.csv')
-    details = dict(scaling=scaling, horizons=list(HORIZONS), lookback_sessions=21,
-                   feature_names=FEATURE_NAMES, latest=latest_info,
+    details = dict(scaling=scaling, horizons=list(range(1,STEPS+1)), target_schema="hourly_path_v1", feature_schema='cross_asset_v2', lookback_sessions=21,
+                   feature_names=FEATURE_NAMES+(['market_return','market_breadth','market_coverage']+[f'context_{i}_{kind}' for i in range(len(context_frames)) for kind in ['hour_return','session_return','available','age']] if x.shape[-1]>8 else []), context_universe=[f.attrs.get('symbol',str(i)) for i,f in enumerate(context_frames)], context_codes=[f.attrs.get('code','') for f in context_frames], latest=latest_info,
                    split_counts={name: len(indices) for name, indices in splits.items()},
                    input_shape=list(x.shape), model_kind='lstm',
                    split_boundaries={name: dict(first=str(metadata.iloc[idx[0]].as_of),
@@ -59,7 +62,7 @@ def train_symbol(hourly, daily, symbol, code, folder, epochs, update):
     _write_bytes_atomic(folder / f'{code}_preprocessing.json', json.dumps(details, ensure_ascii=False, indent=2))
     update('prepared', symbol=symbol, input_shape=list(x.shape), splits=details['split_counts'],
            latest_as_of=latest_info['as_of'], source_last_session=str(pd.to_datetime(daily.Date).max().date()))
-    model = build_network(len(FEATURE_NAMES))
+    model = build_network(x.shape[-1],horizon_count=STEPS)
     summary = []
     model.summary(print_fn=lambda message, **kwargs: summary.append(message))
     _write_bytes_atomic(folder / f'{code}_architecture.txt', '\n'.join(summary))
@@ -85,7 +88,10 @@ def train_symbol(hourly, daily, symbol, code, folder, epochs, update):
     scale = np.array(scaling['target_scale'])
     calibration = splits['calibration']
     mu_cal, sigma_cal = decode(model.predict([xs[calibration], mask[calibration]], verbose=0), scale)
-    factors = np.maximum(np.sqrt(np.mean(((y[calibration]-mu_cal)/sigma_cal)**2, axis=0)), .05)
+    factors=np.ones(STEPS)
+    for j in range(STEPS):
+        valid=np.isfinite(y[calibration,j])
+        if valid.sum()>=10:factors[j]=max(float(np.sqrt(np.mean(((y[calibration,j][valid]-mu_cal[valid,j])/sigma_cal[valid,j])**2))),.05)
     details.update(calibration_sigma_factor=factors.tolist(), epochs_completed=len(rows),
                    best_epoch=int(np.argmin([row['val_loss'] for row in rows]))+1)
     _write_bytes_atomic(folder / f'{code}_preprocessing.json', json.dumps(details, ensure_ascii=False, indent=2))
@@ -93,9 +99,14 @@ def train_symbol(hourly, daily, symbol, code, folder, epochs, update):
     mu, sigma = decode(model.predict([xs[test], mask[test]], verbose=0), scale, factors)
     latest_mu, latest_sigma = decode(model.predict([latest_scaled, latest_mask], verbose=0), scale, factors)
     predictions, metrics = [], []
-    for column, horizon in enumerate(HORIZONS):
+    for column in range(STEPS):
+        day,hour=column//24+1,column%24
+        if hour not in latest_info['future_hours'] or scaling['target_counts'][column]<20 or np.isfinite(y[calibration,column]).sum()<10:continue
+        valid=np.isfinite(y[test,column])
+        if valid.sum()<10:continue
+        horizon=column+1
         base = dict(model_kind='lstm', symbol=symbol, insCode=code, frequency='hourly', horizon=horizon,
-                    horizon_unit='trading_days', lookback_sessions=21)
+                    horizon_unit='hourly_slot', target_day=day, target_hour=hour, target_schema='hourly_path_v1', lookback_sessions=21)
         forecast = price_distribution(latest_info['current_price'], float(latest_mu[0, column]), float(latest_sigma[0, column]))
         forecast.update(base, as_of=latest_info['as_of'], current_price=latest_info['current_price'],
                         mu_log=float(latest_mu[0, column]), sigma_log=float(latest_sigma[0, column]),
@@ -103,26 +114,36 @@ def train_symbol(hourly, daily, symbol, code, folder, epochs, update):
         forecast['lower90'] = forecast['lower_price']/forecast['current_price']-1
         forecast['upper90'] = forecast['upper_price']/forecast['current_price']-1
         predictions.append(forecast)
-        actual = np.expm1(y[test, column])
-        expected = np.expm1(mu[:, column]+.5*sigma[:, column]**2)
-        probability = ndtr(mu[:, column]/sigma[:, column])
-        lower, upper = np.expm1(mu[:, column]-1.6448536269514722*sigma[:, column]), np.expm1(mu[:, column]+1.6448536269514722*sigma[:, column])
-        history = pd.DataFrame(dict(timestamp=metadata.iloc[test].as_of.to_numpy(), actual=actual,
+        test_valid=test[valid]
+        mu_step=mu[valid,column];sigma_step=sigma[valid,column]
+        actual = np.expm1(y[test_valid, column])
+        expected = np.expm1(mu_step+.5*sigma_step**2)
+        probability = ndtr(mu_step/sigma_step)
+        lower, upper = np.expm1(mu_step-1.6448536269514722*sigma_step), np.expm1(mu_step+1.6448536269514722*sigma_step)
+        history = pd.DataFrame(dict(timestamp=metadata.iloc[test_valid].as_of.to_numpy(), actual=actual,
                                     predicted=expected, probability_up=probability, probability_down=1-probability,
-                                    lower90=lower, upper90=upper, mu_log=mu[:, column], sigma_log=sigma[:, column],
-                                    current_price=metadata.iloc[test].current_price.to_numpy()))
+                                    lower90=lower, upper90=upper, mu_log=mu_step, sigma_log=sigma_step,
+                                    current_price=metadata.iloc[test_valid].current_price.to_numpy()))
         history['expanding_mae'] = abs(history.actual-history.predicted).expanding().mean()
         cal_sigma = sigma_cal[:, column]*factors[column]
-        _csv_atomic(pd.DataFrame(dict(timestamp=metadata.iloc[calibration].as_of.to_numpy(),
-            actual=np.expm1(y[calibration, column]), probability_up=ndtr(mu_cal[:, column]/cal_sigma))),
+        cal_valid=np.isfinite(y[calibration,column])
+        _csv_atomic(pd.DataFrame(dict(timestamp=metadata.iloc[calibration].as_of.to_numpy()[cal_valid],
+            current_price=metadata.iloc[calibration].current_price.to_numpy()[cal_valid],
+            actual=np.expm1(y[calibration, column][cal_valid]), probability_up=ndtr(mu_cal[cal_valid, column]/cal_sigma[cal_valid]))),
             folder / f'{code}_hourly_{horizon}_calibration.csv')
         _csv_atomic(history, folder / f'{code}_hourly_{horizon}_test.csv')
         scores = dict(base, mae=float(np.mean(abs(actual-expected))), rmse=float(np.sqrt(np.mean((actual-expected)**2))),
                       direction_accuracy=float(np.mean((probability >= .5) == (actual > 0))),
                       brier=float(np.mean((probability-(actual > 0))**2)), coverage90=float(np.mean((actual >= lower)&(actual <= upper))),
                       baseline_zero_mae=float(np.mean(abs(actual))),
-                      baseline_drift_mae=float(np.mean(abs(actual-np.expm1(y[train, column]).mean()))),
+                      baseline_drift_mae=float(np.mean(abs(actual-np.nanmean(np.expm1(y[train, column]))))),
                       **{f'{name}_rows': len(idx) for name, idx in splits.items()})
+        scores['test_rows']=int(valid.sum())
+        training_values=y[train,column];training_values=training_values[np.isfinite(training_values)]
+        prior=float(np.mean(training_values>0))
+        scores['train_probability_up']=prior
+        scores['baseline_direction_accuracy']=float(np.mean((prior>=.5)==(actual>0)))
+        scores['baseline_brier']=float(np.mean((prior-(actual>0))**2))
         metrics.append(scores)
     update('trained', symbol=symbol, epochs_completed=len(rows), best_epoch=details['best_epoch'])
     return predictions, metrics
@@ -144,6 +165,7 @@ def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, wor
         if previous and (RUNS/previous['run_id']/'metrics.csv').exists():
             shutil.copyfile(RUNS/previous['run_id']/'metrics.csv', folder/'baseline_metrics.csv')
         status = dict(label=('دریافت داده — ' if refresh_only else 'DeepLSTM 96×48 — ')+pd.Timestamp.now(tz='Asia/Tehran').strftime('%Y-%m-%d %H:%M تهران'), run_id=run_id, job_kind='data' if refresh_only else 'training', model_kind='lstm', state='running', stages=[], errors=[], warnings=[], started_at=datetime.now(timezone.utc).isoformat())
+        store=None
 
         def update(stage, **details):
             if stage == 'prepared' and details['latest_as_of'][:10] < details['source_last_session']:
@@ -155,6 +177,11 @@ def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, wor
             else:
                 status['stages'].append(dict(stage=stage, **details))
             save_status(folder, status)
+            if store is not None and hasattr(store,'record_run'):
+                store.record_run(status)
+                if stage=='epoch':
+                    code=store.list_instruments().get(details['symbol'])
+                    if code:store.record_epoch(run_id,code,details)
 
         save_status(folder, status)
         results, metrics = [], []
@@ -163,23 +190,24 @@ def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, wor
             import keras
             tf.config.threading.set_intra_op_parallelism_threads(2)
             tf.config.threading.set_inter_op_parallelism_threads(2)
-            for name in ['neural_data.py', 'neural_network.py', 'neural_training.py']:
+            for name in ['neural_data.py', 'hourly_data.py', 'neural_network.py', 'neural_training.py']:
                 shutil.copyfile(Path(__file__).with_name(name), folder / name)
             _write_bytes_atomic(folder / 'environment.json', json.dumps(dict(python=sys.version,
                 packages=dict(tensorflow=tf.__version__, keras=keras.__version__, numpy=np.__version__,
                               pandas=pd.__version__, scipy=scipy.__version__),
                 model='LSTM96 -> LSTM48 -> Dense64 -> Dense32 -> Gaussian heads', direction_loss_weight=.2,
-                epochs=epochs, seed=42, batch_size=32, lookback_sessions=21, horizons=list(HORIZONS),
+                epochs=epochs, seed=42, batch_size=32, lookback_sessions=21, horizons=list(range(1,STEPS+1)), target_schema='hourly_path_v1',feature_schema='cross_asset_v2',
                 split='60/15/10/15 with max-horizon purge; calibration independent of early stopping',
                 refresh=refresh), indent=2))
             settings = Settings.from_env(BASE / '.env')
             if not settings.root.is_absolute():
                 settings = replace(settings, root=BASE / settings.root)
-            store = CsvMarketStore(settings.root)
+            store = make_store(settings.root)
             selected = symbols or list(instruments())
+            resolved={}
             for symbol in selected:
                 try:
-                    codes = [p.stem for p in (settings.root/'state').glob('*.json') if store.read_state(p.stem).get('symbol') == symbol]
+                    codes = [instruments()[symbol]] if symbol in instruments() else []
                     if not codes and not refresh:
                         raise ValueError('No cached instrument; enable data refresh')
                     if codes:
@@ -203,14 +231,25 @@ def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, wor
                             status['errors'].append(f'{symbol}: refresh failed; training uses cached valid data: {exc}')
                     if refresh_only:
                         update('data_ready', symbol=symbol)
-                        continue
-                    predictions, scores = train_symbol(store.load_hourly(code), store.load_daily(code), symbol, code, folder, epochs, update)
+                    resolved[symbol]=code
+                except Exception as exc:
+                    status['errors'].append(f'{symbol}: {exc}')
+                    update('data_failed',symbol=symbol,error=str(exc))
+            # Freeze context only AFTER every requested refresh, so all target networks see one consistent archive.
+            context_cache={}
+            if not refresh_only:
+                for name,c in dict(instruments()).items():
+                    context_cache[c]=clean_context(store.load_hourly(c),store.load_daily(c),symbol=name,code=c)
+            for symbol,code in ([] if refresh_only else resolved.items()):
+                try:
+                    predictions, scores = train_symbol(store.load_hourly(code), store.load_daily(code), symbol, code, folder, epochs, update, context_frames=[frame for c,frame in context_cache.items() if c!=code])
                     for row in predictions:
                         row['run_id'] = run_id
                     results.extend(predictions)
                     metrics.extend(scores)
                     _csv_atomic(pd.DataFrame(results), folder/'predictions.csv')
                     _csv_atomic(pd.DataFrame(metrics), folder/'metrics.csv')
+                    if hasattr(store,'record_results'):store.record_results(run_id,predictions,scores)
                 except Exception as exc:
                     status['errors'].append(f'{symbol}: {exc}')
                     update('training_failed', symbol=symbol, error=str(exc))
@@ -220,6 +259,7 @@ def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, wor
             status['errors'].append(str(exc))
         status['finished_at'] = datetime.now(timezone.utc).isoformat()
         save_status(folder, status)
+        if store is not None and hasattr(store,'record_run'):store.record_run(status)
         if results:
             prune(run_id)
         return status

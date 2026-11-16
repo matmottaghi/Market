@@ -6,16 +6,18 @@ import json
 import shutil
 import pandas as pd
 from market_data import Settings, CsvMarketStore
+from market_data.sqlite_store import make_store
 from .pipeline import BASE, RUNS
 
 def settings_store():
     settings = Settings.from_env(BASE/'.env')
     if not settings.root.is_absolute():
         settings = replace(settings, root=BASE/settings.root)
-    return settings, CsvMarketStore(settings.root)
+    return settings, make_store(settings.root)
 
 def instruments():
     _, store = settings_store()
+    if hasattr(store,'list_instruments'):return store.list_instruments()
     return {store.read_state(p.stem)['symbol']: p.stem for p in (store.root/'state').glob('*.json') if store.read_state(p.stem).get('symbol')}
 
 def list_runs(root=None):

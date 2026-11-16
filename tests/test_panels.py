@@ -37,6 +37,8 @@ def test_save_selected_symbol(monkeypatch,tmp_path):
     p=tmp_path/'run';p.mkdir()
     (p/'status.json').write_text(json.dumps(dict(run_id='run',state='complete',model_kind='lstm')))
     (p/'11111_lstm.keras').write_text('fixture')
+    (p/'11111_preprocessing.json').write_text(json.dumps({'calibration_sigma_factor':[1]}))
+    (p/'predictions.csv').write_text('insCode\n11111\n')
     monkeypatch.setattr(views,'RUNS',tmp_path)
     monkeypatch.setattr(views,'instruments',lambda:{'توان':'11111'})
     response=views.retain(RequestFactory().post('/retain/',dict(run='run',scope='symbol',symbol='توان',action='save',name='منتخب')))

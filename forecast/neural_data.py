@@ -12,7 +12,7 @@ FEATURE_NAMES = ['log_open', 'log_high', 'log_low', 'log_close', 'log_volume',
                  'hour_sin', 'hour_cos', 'session_position']
 
 
-def prepare_sequences(hourly, daily):
+def prepare_sequences(hourly, daily, require_all_targets=True, allow_unlabeled=False, latest_only=False):
     """One observation at each complete session close; never bridge a missing session."""
     daily = daily.copy()
     daily['Date'] = pd.to_datetime(daily.Date).dt.normalize()
@@ -67,7 +67,8 @@ def prepare_sequences(hourly, daily):
 
     sequences, labels, records = [], [], []
     latest = None
-    for end in range(LOOKBACK-1, len(calendar)):
+    endpoints=range(len(calendar)-1,LOOKBACK-2,-1) if latest_only else range(LOOKBACK-1,len(calendar))
+    for end in endpoints:
         sequence = window(end)
         if sequence is None:
             continue
@@ -75,20 +76,23 @@ def prepare_sequences(hourly, daily):
         price = float(groups[date].Close.iloc[-1])
         latest = dict(sequence=sequence, as_of=str(groups[date].Hour.iloc[-1]),
                       window_start=str(calendar[end-LOOKBACK+1].date()), current_price=price)
+        if latest_only:break
         if end+max(HORIZONS) >= len(calendar):
             continue
         targets = [calendar[end+h] for h in HORIZONS]
-        if any(target not in groups for target in targets):
+        if require_all_targets and any(target not in groups for target in targets):
             continue
-        labels.append([np.log(float(groups[target].Close.iloc[-1])/price) for target in targets])
+        if not require_all_targets and not any(calendar[end+h] in groups for h in range(1,22)):
+            continue
+        labels.append([np.log(float(groups[target].Close.iloc[-1])/price) if target in groups else np.nan for target in targets])
         sequences.append(sequence)
         record = dict(as_of=str(date.date()), window_start=str(calendar[end-LOOKBACK+1].date()),
                       context_sessions=LOOKBACK, bars=len(sequence), current_price=price)
         record.update({f'target_end_{h}': str(target.date()) for h, target in zip(HORIZONS, targets)})
         records.append(record)
-    if not sequences or latest is None:
+    if latest is None or (not sequences and not allow_unlabeled):
         raise ValueError('No complete 21-session hourly windows with valid future targets')
-    length = max(max(map(len, sequences)), len(latest['sequence']))
+    length = max(max(map(len, sequences),default=0), len(latest['sequence']))
     x = np.zeros((len(sequences), length, len(FEATURE_NAMES)), dtype='float32')
     mask = np.zeros(x.shape[:2], dtype=bool)
     for i, sequence in enumerate(sequences):
@@ -99,7 +103,8 @@ def prepare_sequences(hourly, daily):
     sequence = latest.pop('sequence')
     latest_x[0, :len(sequence)] = sequence
     latest_mask[0, :len(sequence)] = True
-    return x, mask, np.asarray(labels, dtype='float32'), pd.DataFrame(records), latest_x, latest_mask, latest
+    columns=['as_of','window_start','context_sessions','bars','current_price']+[f'target_end_{h}' for h in HORIZONS]
+    return x, mask, np.asarray(labels, dtype='float32'), pd.DataFrame(records,columns=columns), latest_x, latest_mask, latest
 
 
 def chronological_splits(metadata):

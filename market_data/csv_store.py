@@ -35,6 +35,7 @@ import json
 import os
 import re
 import tempfile
+import time
 
 import pandas as pd
 
@@ -46,6 +47,16 @@ def _code(ins_code: str) -> str:
     return code
 
 
+def _replace_atomic(temporary,path):
+    # Windows readers/antivirus may briefly deny replacement; preserve the old file and retry.
+    for attempt in range(8):
+        try:
+            os.replace(temporary,path)
+            return
+        except PermissionError:
+            if attempt==7:raise
+            time.sleep(.05*(attempt+1))
+
 def _write_bytes_atomic(path: Path, contents: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".tmp_", suffix=".part", dir=path.parent)
@@ -54,7 +65,7 @@ def _write_bytes_atomic(path: Path, contents: str) -> None:
             stream.write(contents)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _replace_atomic(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -68,7 +79,7 @@ def _csv_atomic(df: pd.DataFrame, path: Path) -> None:
             df.to_csv(stream, index=False)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _replace_atomic(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

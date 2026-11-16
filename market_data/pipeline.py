@@ -20,6 +20,7 @@ from filelock import FileLock, Timeout
 from .cleaning import clean_stock_data
 from .config import Settings
 from .csv_store import CsvMarketStore
+from .sqlite_store import make_store
 from .csv_store import _csv_atomic
 import json
 from .provider import TsetmcClient
@@ -46,6 +47,7 @@ def sync_market(
     max_hourly_days: int | None = None,
     workers: int = 1,
     progress=None,
+    hourly_start=None,
 ) -> dict[str, dict]:
     """Download and persist daily+hourly series without reading all stored CSVs.
 
@@ -55,7 +57,7 @@ def sync_market(
     """
     settings = settings or Settings.from_env()
     client = client or TsetmcClient(settings)
-    store = store or CsvMarketStore(settings.root)
+    store = store or make_store(settings.root)
     if max_hourly_days is None:
         max_hourly_days = settings.hourly_max_days
     if max_hourly_days < 0:
@@ -67,13 +69,13 @@ def sync_market(
     try:
         with FileLock(str(settings.root / ".market_sync.lock"), timeout=0):
             return _run_locked(instruments, settings, client, store, full_reconcile,
-                               retry_incomplete_hourly, max_hourly_days, workers, progress)
+                               retry_incomplete_hourly, max_hourly_days, workers, progress, hourly_start)
     except Timeout as exc:
         raise RuntimeError("Another market sync is already running") from exc
 
 
 def _run_locked(instruments, settings, client, store, full_reconcile,
-                retry_incomplete_hourly, max_hourly_days, workers, progress):
+                retry_incomplete_hourly, max_hourly_days, workers, progress, hourly_start):
     reports = {}
     for symbol, ins_code in instruments.items():
         ins_code = str(ins_code)
@@ -106,6 +108,8 @@ def _run_locked(instruments, settings, client, store, full_reconcile,
         _, model = clean_stock_data(store.load_daily(ins_code))
 
         hourly_dates = model[["Date", "qTotTran5J"]].drop_duplicates("Date").sort_values("Date", ascending=False)
+        if hourly_start:
+            hourly_dates=hourly_dates[hourly_dates.Date>=pd.Timestamp(hourly_start)]
         outstanding = []
         for row in hourly_dates.itertuples(index=False):
             # A matched intraday snapshot can still gain new hours later today.
@@ -183,8 +187,10 @@ def _run_locked(instruments, settings, client, store, full_reconcile,
             quality = 'missing'
             if path.exists() and meta.exists():
                 quality = json.loads(meta.read_text(encoding='utf-8')).get('data_quality', 'unverified')
+            if hasattr(store,'day_quality'):quality=store.day_quality(ins_code,row.Date)
             failure = store.hourly_failure_path(ins_code, row.Date)
             reason = json.loads(failure.read_text(encoding='utf-8')).get('error', '') if failure.exists() else ''
+            if hasattr(store,'day_error'):reason=store.day_error(ins_code,row.Date)
             coverage.append(dict(Symbol=symbol, insCode=ins_code, Date=row.Date, quality=quality, error=reason))
         coverage_df = pd.DataFrame(coverage)
         _csv_atomic(coverage_df, settings.root / 'coverage' / f'{ins_code}.csv')
