@@ -56,9 +56,36 @@ class SqliteMarketStore(CsvMarketStore):
                 (SELECT COUNT(*) FROM hourly_bars h WHERE h.code=i.code),
                 (SELECT MAX(date) FROM daily_bars d WHERE d.code=i.code),
                 (SELECT MAX(date) FROM hourly_bars h WHERE h.code=i.code),
-                (SELECT COUNT(*) FROM ingestion_issues e WHERE e.code=i.code)
+                (SELECT COUNT(*) FROM ingestion_issues e WHERE e.code=i.code),i.code,
+                (SELECT MAX(hour) FROM hourly_bars h WHERE h.code=i.code),
+                (SELECT MIN(date) FROM daily_bars d WHERE d.code=i.code),
+                (SELECT MIN(date) FROM hourly_bars h WHERE h.code=i.code)
                 FROM instruments i ORDER BY i.symbol''').fetchall()
-        return [dict(zip(['symbol','daily','hourly','daily_end','hourly_end','issues'],row)) for row in rows]
+        return [dict(zip(['symbol','daily','hourly','daily_end','hourly_end','issues','code','last_hour','daily_start','hourly_start'],row)) for row in rows]
+
+    def latest_rows(self,code,frequency,limit=10):
+        """Read a bounded newest-first preview; never load complete history for a table."""
+        if frequency not in ('daily','hourly'):raise ValueError('Unknown frequency')
+        if not 1<=int(limit)<=50:raise ValueError('Preview limit must be 1 to 50')
+        column='date' if frequency=='daily' else 'hour'
+        with self.connect() as db:
+            rows=db.execute(f'SELECT payload,ingested_at FROM {frequency}_bars WHERE code=? ORDER BY {column} DESC LIMIT ?',(_code(code),int(limit))).fetchall()
+        return [dict(json.loads(payload),_ingested_at=at) for payload,at in rows]
+
+    def coverage_summary(self,code):
+        """Count daily active sessions with absent or volume-matched hourly candles."""
+        matched="h.bars IS NOT NULL AND h.qmin='matched' AND h.qmax='matched' AND ABS(h.total/d.volume-1)<=0.001"
+        with self.connect() as db:
+            row=db.execute(f'''WITH h AS (
+                SELECT date,COUNT(*) bars,SUM(volume) total,MIN(COALESCE(quality,'')) qmin,
+                MAX(COALESCE(quality,'')) qmax,MAX(hour) last_hour FROM hourly_bars WHERE code=? GROUP BY date)
+                SELECT COUNT(*),SUM(CASE WHEN {matched} THEN 1 ELSE 0 END),
+                SUM(CASE WHEN h.bars IS NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN h.bars IS NOT NULL AND NOT({matched}) THEN 1 ELSE 0 END),
+                MAX(CASE WHEN {matched} THEN h.last_hour END)
+                FROM daily_bars d LEFT JOIN h ON h.date=d.date
+                WHERE d.code=? AND d.volume>0 AND COALESCE(json_extract(d.payload,'$.zTotTran'),0)>0''',(_code(code),_code(code))).fetchone()
+        return dict(active_days=row[0],matched_days=row[1] or 0,missing_days=row[2] or 0,invalid_days=row[0]-(row[1] or 0)-(row[2] or 0),last_matched_hour=row[4])
 
     def read_state(self, ins_code):
         with self.connect() as db:

@@ -1,5 +1,6 @@
 # توضیح فایل: مسیرهای سه پنل، استریم، پیش‌بینی تازه، جستجوی نماد و مدیریت مدل؛ تابع مستقلی ندارد.
 from django.urls import path
+from forecast.data_views import data_page
 from forecast.views import dashboard, launch, stream, retain
 urlpatterns=[path('',dashboard,name='dashboard'),path('training/',dashboard,name='training'),path('market/',dashboard,name='market'),path('run/',launch,name='launch'),path('stream/',stream,name='stream'),path('retain/',retain,name='retain')]
 
@@ -11,3 +12,4 @@ urlpatterns += [path("models/download/",download_model)]
 
 from forecast.views import refresh_prediction,prediction_status
 urlpatterns += [path("forecast/refresh/",refresh_prediction),path("forecast/status/",prediction_status)]
+urlpatterns += [path('data/',data_page,name='data')]

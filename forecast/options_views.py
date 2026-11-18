@@ -2,6 +2,7 @@
 # options_page خواندن و محاسبه؛ refresh_option_data دریافت منبع با CSRF؛ symbol_search جستجوی دقیق/جزئی؛ register_symbol ثبت شناسهٔ تأییدشده.
 from dataclasses import replace
 import json
+from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -116,6 +117,7 @@ def register_symbol(request):
         symbol=info['lVal18AFC'].strip();known=instruments()
         if symbol in known and known[symbol]!=code:raise ValueError('این نماد با شناسهٔ دیگری ثبت شده؛ ابتدا هویت نماد را بررسی کنید.')
         store.update_state(code,symbol=symbol,name=info.get('lVal30'),sector=info.get('sector',{}),instrument_type=info.get('faraDesc'))
-        return redirect('/training/?symbol='+symbol)
+        target='/data/' if request.POST.get('next')=='/data/' else '/training/'
+        return redirect(target+'?'+urlencode(dict(symbol=symbol)))
     except Exception as exc:return HttpResponseBadRequest(str(exc))
     finally:client.session.close()

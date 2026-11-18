@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -174,12 +175,17 @@ def stream(request):
 @require_POST
 def launch(request):
     try:
+        data_request=request.POST.get('next')=='/data/' and request.POST.get('action')=='refresh'
         epochs=int(request.POST.get('epochs','200'))
         if not 1<=epochs<=200:raise ValueError()
-        symbols=request.POST.getlist('symbols') or list(instruments())
+        symbols=request.POST.getlist('symbols') or ([] if data_request else list(instruments()))
         extra=request.POST.get('new_symbols','').replace('،',',').split(',')
         symbols=list(dict.fromkeys(symbols+[s.strip() for s in extra if s.strip()]))
         if not symbols or any(len(s)>60 or '/' in s or '\\' in s for s in symbols):raise ValueError()
+        if data_request:
+            if any(s not in instruments() for s in symbols):raise ValueError()
+            hourly_days=int(request.POST.get('hourly_days','21'))
+            if hourly_days not in (0,21,63):raise ValueError()
     except ValueError:return HttpResponseBadRequest('ورودی نامعتبر')
     RUNS.mkdir(parents=True,exist_ok=True)
     try:
@@ -187,9 +193,13 @@ def launch(request):
             args=[sys.executable,str(BASE/'manage.py'),'train_forecast','--epochs',str(epochs),'--symbols',*symbols]
             if request.POST.get('action')!='refresh' and request.POST.get('offline') and not any(s not in instruments() for s in symbols):args.append('--offline')
             if request.POST.get('action')=='refresh':args.append('--refresh-only')
+            if data_request:args.extend(['--hourly-days',str(hourly_days),'--workers','4'])
             with (RUNS/'worker.log').open('a',encoding='utf8') as log:
                 subprocess.Popen(args,cwd=BASE,stdout=log,stderr=log,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
     except Timeout:return HttpResponse('آموزش یا دریافت دیگری در حال اجراست.',status=409)
+    if data_request:
+        symbol=request.POST.get('view_symbol')
+        return redirect('/data/?'+urlencode(dict(symbol=symbol if symbol in instruments() else symbols[0])))
     return redirect('dashboard')
 
 @require_POST

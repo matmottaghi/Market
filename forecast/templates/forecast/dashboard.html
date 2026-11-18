@@ -1,10 +1,10 @@
 {# توضیح فایل: پنل RTL دو تب آموزش/بازار، KPI، اسلایسر و تصمیم تعاملی؛ منطق زنده در panel.js است. #}
 {% load static %}<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>آزمایشگاه بازار</title>
 <script src="{% static 'forecast/plotly.js' %}"></script><link rel="stylesheet" href="{% static 'forecast/workspace.css' %}?v={{ asset_version }}"></head><body>
-<nav><a href="{% url 'training' %}">آموزش و ارزیابی مدل</a><a href="{% url 'market' %}">پیش‌بینی بازار</a><a href="/options/">بازار و استراتژی آپشن</a></nav>
+<nav><a href="/data/">داده‌های من</a><a href="{% url 'training' %}">آموزش و ارزیابی مدل</a><a href="{% url 'market' %}">پیش‌بینی بازار</a><a href="/options/">بازار و استراتژی آپشن</a></nav>
 {% if page == 'train' %}
 <header><small>MARKET RESEARCH · SQLite</small><h1>آموزش شبکهٔ چندنمادی</h1><p>۲۱ جلسهٔ ورودی · مسیر مستقیم ساعتی تا ۲۱ جلسهٔ آینده · ماسک کیفیت و زمینهٔ بازار</p></header>
-<section><h2>جستجو و ثبت دارایی</h2><div class="filters"><input id="symbol-query" placeholder="نام یا بخشی از نماد، مثلاً استیل"><button type="button" id="remote-search">جستجو در TSETMC</button></div><div id="symbol-results" class="cards"></div><form id="register-symbol-form" method="post" action="/symbols/register/">{% csrf_token %}<input type="hidden" name="code" id="register-code"></form><small>هویت شناسه هنگام ثبت دوباره کنترل می‌شود؛ سپس نماد را برای دریافت و آموزش انتخاب کنید.</small></section>
+<section class="data-entry-link"><h2>آرشیو و دریافت داده</h2><p>نمادهای موجود، آخرین رکوردهای روزانه و ساعتی و دریافت داده در پنل داده‌های من قرار دارند.</p><a class="pill" href="/data/?symbol={{ symbol|urlencode }}">مشاهدهٔ داده‌های {{ symbol }}</a></section>
 <section><h2>تنظیم آزمایش</h2><p>این انتخاب‌ها دارایی‌های هدف آموزش‌اند؛ نمادهای دیگر دیتابیس به‌عنوان زمینهٔ بازار استفاده می‌شوند. برای شروع، سه هدف اصلی انتخاب شده‌اند.</p><form method="post" action="{% url 'launch' %}">{% csrf_token %}
 <label>حداکثر Epoch <input type="number" min="1" max="200" name="epochs" value="200"></label>
 <p>۲۰۰ سقف اجرایی این پروژه است؛ شبکه از نظر نظری سقف ثابتی ندارد. توقف زودهنگام می‌تواند آموزش را زودتر پایان دهد.</p>
@@ -14,7 +14,6 @@
 <button name="action" value="train">شروع آموزش</button><button name="action" value="refresh">فقط دریافت / به‌روزرسانی داده</button>
 </form><p>برای دریافت جدید تیک آفلاین را بردارید. نماد جدید به‌صورت خودکار از TSETMC شناسایی و آرشیو می‌شود. برای پنجره و چهار بخش ارزیابی، تاریخچهٔ کافی لازم است.</p></section>
 <section><h2>جریان زندهٔ آموزش</h2><p id="live">در انتظار وضعیت ...</p><div id="stream-learning"></div><small>پیشرفت و منحنی هر epoch از طریق SSE دریافت می‌شود؛ صفحه باز می‌ماند.</small></section>
-<section><details><summary>آرشیو محلی و کیفیت دریافت · {{ inventory|length }} نماد</summary><p>تعدادها رکوردهای ذخیره‌شده‌اند؛ فقط جلسات معتبر به آموزش وارد می‌شوند. خطای دریافت، روز مفقود را صفر نمی‌کند. گزارش دقیق روزبه‌روز در پوشهٔ coverage موجود است.</p><div class="table-wrap"><table><tr><th>نماد</th><th>روزانه</th><th>ساعتی</th><th>آخرین روزانه</th><th>آخرین ساعتی</th><th>خطاهای دریافت</th></tr>{% for item in inventory %}<tr><td>{{ item.symbol }}</td><td>{{ item.daily }}</td><td>{{ item.hourly }}</td><td>{{ item.daily_end|default:'—' }}</td><td>{{ item.hourly_end|default:'—' }}</td><td>{{ item.issues }}</td></tr>{% endfor %}</table></div></details></section>
 {% endif %}
 <section id="result"><h2>{% if page == 'market' %}داشبورد بازار{% else %}داشبورد ارزیابی آموزش{% endif %}</h2>
 <form class="filters" method="get"><label>مدل / اجرا<select name="run">{% for r in runs %}<option value="{{ r.run_id }}" {% if current.run_id == r.run_id %}selected{% endif %}>{{ r.label }} {% if r.saved %}★ ذخیره‌شده{% endif %}</option>{% endfor %}</select></label>
