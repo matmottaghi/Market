@@ -1,6 +1,6 @@
 # توضیح فایل: آزمون مسیر ساعتی پویا، بستهٔ مدل و سناریوی آپشن بدون درخواست شبکه یا تغییر دادهٔ واقعی.
 # fixture workspace مخزن و مدل مستقل می‌سازد؛ سه آزمون زیر قرارداد صفحه و محاسبه را بررسی می‌کنند.
-import os,json,io,zipfile
+import os,json,io,zipfile,re
 from dataclasses import replace
 import pandas as pd
 import pytest
@@ -33,8 +33,22 @@ def test_dynamic_report_days(workspace):
     response=client.get('/market/',dict(run='demo',symbol='اهرم',days=3))
     assert response.status_code==200
     text=response.content.decode()
-    assert 'بازده پایان جلسه 3' in text and 'بازده پایان جلسه 4' not in text
-    assert 'جلسه 3 — ساعت 12' in text and 'جلسه 4 — ساعت' not in text
+    payload=json.loads(re.search(r'<script id="market-forecast-data" type="application/json">(.*?)</script>',text,re.S).group(1))
+    assert len(payload['rows'])==84
+    assert max(row['target_day'] for row in payload['rows'])==21
+    assert 'id="forecast-start"' in text and 'id="forecast-end"' in text
+
+
+def test_modern_json_run_is_visible(workspace):
+    from forecast.table_io import read_table,write_table
+    client,store,folder=workspace
+    write_table(read_table(folder/'predictions.csv',dtype={'insCode':str}),folder/'predictions.json')
+    (folder/'predictions.csv').unlink()
+    response=client.get('/market/',dict(run='demo',symbol='اهرم',days=2))
+    assert response.status_code==200
+    text=response.content.decode()
+    payload=json.loads(re.search(r'<script id="market-forecast-data" type="application/json">(.*?)</script>',text,re.S).group(1))
+    assert len(payload['rows'])==84 and payload['rows'][0]['insCode']=='12345'
 
 def test_download_contains_scaler_and_hashes(workspace):
     client,store,folder=workspace

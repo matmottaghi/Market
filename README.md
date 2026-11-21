@@ -13,7 +13,7 @@ python manage.py runserver 127.0.0.1:8000
 
 ## داده و بازگشت
 
-نقطهٔ بازگشت قبل از تغییرات: `9b84239`. داده و مدل قدیم خارج Git در `data/rollback_9b84239` محفوظ‌اند؛ راهنمای بازگشت در همان پوشه است. CSVهای اولیه پاک نشده‌اند.
+نقطهٔ بازگشت قبل از تغییرات: `9b84239`. داده و مدل قدیم خارج Git در `data/rollback_9b84239` محفوظ‌اند؛ راهنمای بازگشت در همان پوشه است. CSVهای اولیه پس از تطبیق با دیتابیس از پوشهٔ فعال حذف و در ZIP پشتیبان data/backups نگهداری شده‌اند.
 
 مخزن فعال `data/market_csv/market.sqlite3` است. کلیدهای نماد/تاریخ و نماد/ساعت یکتا هستند. migration_report تطبیق تمام ستون‌های ۸۰۱۸ سطر روزانه و ۲۳۳۴۹ سطر ساعتی اولیه را ثبت کرده است. پس از توسعهٔ سبد: ۱۷ نماد، ۴۱٬۲۸۱ روزانه و ۷۱٬۱۲۶ ساعتی؛ گزارش سلامت/پوشش در `data_audit.json` و `coverage` است.
 
@@ -48,3 +48,23 @@ node --check forecast/static/forecast/options_builder.js
 [راهنمای کامل منطق صفحات، پاکسازی، ریاضی شبکه، خطا و تمام استراتژی‌ها](GUIDE_FA.md)
 
 قیمت‌ها فعلاً تعدیل‌نشده‌اند. منبع عمومی snapshot است؛ زمان دریافت با زمان معامله فرق دارد و زمان مستقل quote آپشن موجود نیست. تعطیلات رسمی و قواعد اعمال/وجه تضمین باید کنترل شوند. هیچ سفارش واقعی ارسال نمی‌شود.
+
+
+اصلاح دریافت افزایشی: دادهٔ جدید بازار فقط SQLite و آثار جدولی مدل جدید JSON هستند؛ CSV قدیمی فقط خوانده می‌شود. تاریخچه برای هر سهم مستقل است و محدودیت خودکار بر اساس اهرم یا جدیدترین سهم ندارد؛ فقط MARKET_HISTORY_START در صورت تنظیم صریح، تاریخ شروع را محدود می‌کند. ورودی جدید نمادها را بر تاریخ/ساعت دقیق هم‌تراز می‌کند (cross_asset_exact_v3) و برای استفاده از آن باید بازآموزی انجام شود. تاریخچهٔ قدیمی موجود حذف نشده است.
+
+
+پاک‌سازی CSV انجام شد: تمام جدول‌های قدیمی مدل به JSON منتقل شدند و هیچ CSV مستقلی در پروژه باقی نمانده است. نسخهٔ اصلی فایل‌های حذف‌شده، همراه manifest و SHA256، در data/backups/csv_retirement_20261119T075810Z.zip محفوظ است. گزارش در data/csv_retirement_report.json قرار دارد.
+
+
+### Hourly return model (v2)
+New training runs use `hourly_returns_v2`: an observation at each verified hourly close,
+eight features per asset, and signed next-hour log returns. Returns compound into prices
+for up to 21 trading sessions (only trading hours; no fabricated overnight candles).
+Each instrument uses its entire available history; younger context instruments do not
+truncate older target history. `MARKET_HISTORY_START` explicitly overrides the start. Missing target hours remain masked.
+Chronological splits purge the full 21-session target interval. Calibration residuals
+are saved separately and sampled into 256 reproducible branching price paths; chart
+bands and the price histogram use the same paths. Direction weight remains 0.2.
+Old distribution models remain readable; retraining is required to use the new target.
+Refresh: `python manage.py train_forecast --refresh-only --full-history --workers 2`.
+Offline training: `python manage.py train_forecast --offline`.

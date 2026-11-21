@@ -81,8 +81,14 @@ class TsetmcClient:
             raise ValueError(f"Symbol {symbol!r}: expected one exact instrument, found {len(codes)}; inspect TSETMC search results")
         return codes.pop()
 
-    def get_daily(self, symbol: str, ins_code: str) -> pd.DataFrame:
-        payload = self._json(f"ClosingPrice/GetClosingPriceDailyList/{ins_code}/0")
+    def get_daily_since(self,symbol,ins_code,start):
+        """Request only enough recent daily rows to cover the incremental boundary."""
+        days=max(0,(pd.Timestamp.now(tz='Asia/Tehran').date()-pd.Timestamp(start).date()).days)
+        frame=self.get_daily(symbol,ins_code,limit=max(30,days+15))
+        return frame[frame.Date>=pd.Timestamp(start)].copy() if not frame.empty else frame
+
+    def get_daily(self, symbol: str, ins_code: str, limit=0) -> pd.DataFrame:
+        payload = self._json(f"ClosingPrice/GetClosingPriceDailyList/{ins_code}/{int(limit)}")
         rows = payload.get("closingPriceDaily")
         if not isinstance(rows, list):
             raise ValueError(f"Invalid closingPriceDaily for {symbol}")

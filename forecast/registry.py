@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import shutil
 import pandas as pd
+from .table_io import read_table,write_table,table_path,learning_tables
 from market_data import Settings, CsvMarketStore
 from market_data.sqlite_store import make_store
 from .pipeline import BASE, RUNS
@@ -45,13 +46,13 @@ def prune(keep, root=None):
                     prefix=file.name.split('_')[0]
                     if file.is_file() and prefix.isdigit() and prefix not in selected:
                         file.unlink()
-                for name in ('predictions.csv','metrics.csv'):
-                    target=path/name
+                for name in ('predictions.json','metrics.json'):
+                    target=table_path(path/name)
                     if target.exists():
-                        frame=pd.read_csv(target,dtype={'insCode':str})
+                        frame=read_table(target,dtype={'insCode':str})
                         if 'insCode' in frame:
-                            from market_data.csv_store import _csv_atomic
-                            _csv_atomic(frame[frame.insCode.isin(selected)],target)
+                            from .table_io import write_table
+                            write_table(frame[frame.insCode.isin(selected)],target)
         else:
             shutil.rmtree(path)
 

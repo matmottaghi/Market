@@ -21,9 +21,10 @@ class Command(BaseCommand):
 
         parser.add_argument('--symbols', nargs='+')
         parser.add_argument('--refresh-only', action='store_true')
+        parser.add_argument('--context-symbols', nargs='*', default=None, help='Context tickers; omit for all, pass without values for target only')
 
     def handle(self, *args, **options):
         if options['hourly_days'] < 0:
             raise ValueError('hourly-days must be nonnegative')
-        result = run_neural_pipeline(not options['offline'], options['hourly_days'], options['full_history'], options['workers'], options['epochs'], symbols=options['symbols'], refresh_only=options['refresh_only'])
+        result = run_neural_pipeline(not options['offline'], options['hourly_days'], options['full_history'], options['workers'], options['epochs'], symbols=options['symbols'], refresh_only=options['refresh_only'],context_symbols=options['context_symbols'])
         self.stdout.write(json.dumps(result, ensure_ascii=True, indent=2))

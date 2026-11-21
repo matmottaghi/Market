@@ -1,0 +1,23 @@
+<div id="market-forecast" class="market-forecast">
+  <div class="forecast-heading"><div><small>بازده ساعتی ← مسیر قیمت ← توزیع سناریوها</small><h3>مسیر پیش‌بینی تا ۲۱ جلسهٔ معاملاتی</h3></div><span id="forecast-model" class="pill"></span></div>
+  <p>هر نقطه یک کندل ساعتیِ برنامهٔ معاملاتی مدل است؛ ساعت درج‌شده، شروع کندل است. شمارهٔ جلسه از اولین جلسهٔ آینده شروع می‌شود و باقی‌ماندهٔ جلسهٔ جاری جدا مشخص می‌شود. بازهٔ دلخواه را انتخاب کنید؛ بخش‌های بیرون از بازه از نمودارها و جدول پنهان می‌شوند. فیلتر نمایش، مدل و تنظیمات جهت را تغییر نمی‌دهد.</p>
+  <div id="forecast-empty" class="empty" hidden>برای این سهم هنوز مسیر پیش‌بینی موجود نیست. پس از آموزش و ذخیرهٔ مدل، ساعت‌های دارای خروجی در اینجا نمایش داده می‌شوند.</div>
+  <div id="forecast-controls" class="time-slicer">
+    <div class="forecast-heading"><strong>فیلتر ساعت‌های پیش‌بینی</strong><button id="forecast-reset" type="button">نمایش تمام ساعت‌ها</button></div>
+    <div class="slicer-grid">
+      <label>شروع بازه <select id="forecast-start-select" aria-label="شروع بازهٔ پیش‌بینی"></select><input id="forecast-start" type="range" min="0" value="0" aria-label="اسلایدر شروع بازه"></label>
+      <label>پایان بازه <select id="forecast-end-select" aria-label="پایان بازهٔ پیش‌بینی"></select><input id="forecast-end" type="range" min="0" value="0" aria-label="اسلایدر پایان بازه"></label>
+    </div>
+    <p id="forecast-window" role="status" aria-live="polite"></p>
+    <label><input id="forecast-band" type="checkbox" checked>نمایش محدودهٔ عدم‌قطعیت</label>
+    <label><input id="forecast-scenarios" type="checkbox" checked>نمایش مسیرهای سناریویی</label>
+    <label>ساعت بررسی قیمت و توزیع <select id="forecast-point" aria-label="ساعت بررسی توزیع قیمت"></select></label>
+  </div>
+  <label>نمای بازده <select id="forecast-return-mode"><option value="hourly">بازده هر ساعت نسبت به ساعت قبل</option><option value="cumulative">بازده تجمعی از قیمت مبنا</option></select></label>
+  <div id="forecast-summary" class="cards" aria-live="polite"></div>
+  <div id="forecast-price" class="forecast-main-chart" aria-label="نمودار قیمت پیش‌بینی و محدوده خطا"></div>
+  <div class="chart-grid"><div id="forecast-return" aria-label="نمودار بازده پیش‌بینی"></div><div id="forecast-distribution" aria-label="توزیع قیمت در ساعت انتخابی"></div></div>
+  <p id="forecast-method"></p>
+  <details><summary>قیمت و بازده همهٔ ساعت‌های بازهٔ انتخابی</summary><div class="table-wrap"><table><thead><tr><th>ساعت پیش‌بینی</th><th>قیمت مورد انتظار / مرکزی</th><th>بازده از مبنا</th><th>بازده ساعتی شبکه</th><th>حد پایین</th><th>حد بالا</th><th>احتمال صعود از مبنا</th></tr></thead><tbody id="forecast-table"></tbody></table></div></details>
+  <details class="forecast-explainer"><summary>این پیش‌بینی چطور ساخته می‌شود؟</summary><p>در مدل بازده ساعتی، شبکه از پنجرهٔ ۲۱ جلسه‌ای و هشت ویژگی برای هر سهم استفاده می‌کند: باز، بیشینه، کمینه، بسته، حجم، دو مؤلفهٔ ساعت و موقعیت در پنجره. بازده‌های مثبت و منفی ساعت‌های آینده ترکیب می‌شوند تا مسیر قیمت ساخته شود. محدوده و توزیع قیمت از نمونه‌گیری خطاهای بخش کالیبراسیون به دست می‌آیند.</p><p>کنترل کیفیت شامل اعتبار قیمت‌ها، ترتیب بیشینه و کمینه، ساعت تکراری و تطبیق حجم روزانه است. ساعت آیندهٔ فاقد داده در آموزش برچسب ساختگی نمی‌گیرد. دادهٔ مفقود سهم‌های زمینه فعلاً با صفر جایگزین می‌شود. مسیرهای سناریویی برآورد عدم‌قطعیت‌اند و تضمین قیمت آینده نیستند.</p></details>
+</div>

@@ -45,8 +45,18 @@ def test_later_market_close_never_leaks_into_earlier_target():
     changed=prepare_hourly_sequences(hourly,daily,[gold])
     np.testing.assert_array_equal(original[0][0],changed[0][0])
     last=int(original[1][0].sum())-1
-    assert original[0][0,last,13]==1 # Prior completed observation is available.
-    assert original[0][0,last,14]>0  # Staleness is explicit.
+    assert original[0][0,last,13]==0 # Different trading hours are unavailable, not carried from yesterday.
+    assert original[0][0,last,14]==1
+
+def test_context_uses_the_same_date_and_hour_only():
+    hourly,daily=sample()
+    result=prepare_hourly_sequences(hourly,daily,[hourly.copy()])
+    assert result[6]['feature_schema']=='cross_asset_exact_v3'
+    last=int(result[1][0].sum())-1
+    target=hourly[hourly.Date<=daily.Date.iloc[20]].iloc[-1]
+    previous=hourly[hourly.Hour<target.Hour].iloc[-1]
+    np.testing.assert_allclose(result[0][0,last,11],np.log(target.Close/previous.Close),rtol=1e-4)
+    assert result[0][0,last,13]==1 and result[0][0,last,14]==0
 
 
 def test_context_rejects_stale_volume_and_invalid_ohlc():

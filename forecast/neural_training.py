@@ -3,6 +3,7 @@
 # run_neural_pipeline هماهنگی دریافت، ثبت وضعیت و آموزش نمادهای انتخابی؛ EpochRecorder.on_epoch_end ثبت زندهٔ منحنی‌ها.
 # row_without_epoch مقادیر عددی منحنی را برای ذخیرهٔ پیشرفت از شمارهٔ epoch جدا می‌کند؛ update وضعیت اتمیک اجرا را ثبت می‌کند.
 from dataclasses import replace
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 import json
@@ -12,16 +13,21 @@ import uuid
 
 import numpy as np
 import pandas as pd
+from .table_io import read_table,write_table,table_path,learning_tables
 import scipy
 from filelock import FileLock
 from scipy.special import ndtr
 
 from market_data import Settings, CsvMarketStore, TsetmcClient, sync_market
 from market_data.sqlite_store import make_store
-from market_data.csv_store import _write_bytes_atomic, _csv_atomic
+from market_data.history_scope import history_start
+from market_data.csv_store import _write_bytes_atomic
+
 from .pipeline import BASE, RUNS, save_status
 from .registry import instruments, prune, list_runs
-from .hourly_data import prepare_hourly_sequences, scale_hourly, STEPS, clean_context
+from .hourly_data import scale_hourly, STEPS, clean_context
+from .return_data import prepare_returns as prepare_hourly_sequences
+from .scenarios import scenario_paths, scenario_summary
 from .neural_data import prepare_sequences, chronological_splits, scale_sequences, price_distribution, HORIZONS, FEATURE_NAMES
 
 
@@ -47,14 +53,16 @@ def train_symbol(hourly, daily, symbol, code, folder, epochs, update, context_fr
     metadata['split'] = 'purged'
     for name, indices in splits.items():
         metadata.loc[indices, 'split'] = name
-    _csv_atomic(metadata, folder / f'{code}_windows.csv')
+    write_table(metadata, folder / f'{code}_windows.json')
     np.savez_compressed(folder / f'{code}_prepared.npz', x=x, mask=mask, y_log_return=y,
                         latest_x=latest_x, latest_mask=latest_mask, **splits)
-    _csv_atomic(hourly, folder / f'{code}_hourly_dataset.csv')
-    details = dict(scaling=scaling, horizons=list(range(1,STEPS+1)), target_schema="hourly_path_v1", feature_schema='cross_asset_v2', lookback_sessions=21,
-                   feature_names=FEATURE_NAMES+(['market_return','market_breadth','market_coverage']+[f'context_{i}_{kind}' for i in range(len(context_frames)) for kind in ['hour_return','session_return','available','age']] if x.shape[-1]>8 else []), context_universe=[f.attrs.get('symbol',str(i)) for i,f in enumerate(context_frames)], context_codes=[f.attrs.get('code','') for f in context_frames], latest=latest_info,
+    # Raw market history stays exclusively in SQLite; prepared NPZ is the reproducible model input.
+    details = dict(target_symbol=symbol,target_code=code,scaling=scaling, horizons=list(range(1,STEPS+1)), target_schema="hourly_returns_v3", feature_schema='assets_eight_v1', lookback_sessions=21,
+                   feature_names=FEATURE_NAMES+[f'context_{i}_{kind}' for i in range(len(context_frames)) for kind in FEATURE_NAMES], context_universe=[f.attrs.get('symbol',str(i)) for i,f in enumerate(context_frames)], context_codes=[f.attrs.get('code','') for f in context_frames], latest=latest_info,
                    split_counts={name: len(indices) for name, indices in splits.items()},
-                   input_shape=list(x.shape), model_kind='lstm',
+                   forecast_sessions=21,
+                   split_input_periods={name: dict(first=str(metadata.iloc[idx].window_start.min()),last=str(metadata.iloc[idx].as_of.max())) for name,idx in splits.items()},
+                   input_shape=list(x.shape), model_kind='lstm', history_start=(context_frames[0].attrs.get('history_start') if context_frames else None) or str(pd.to_datetime(daily.Date).min().date()),
                    split_boundaries={name: dict(first=str(metadata.iloc[idx[0]].as_of),
                                                 last=str(metadata.iloc[idx[-1]].as_of),
                                                 last_target=str(metadata.iloc[idx[-1]].target_end_21))
@@ -72,48 +80,71 @@ def train_symbol(hourly, daily, symbol, code, folder, epochs, update, context_fr
         def on_epoch_end(self, epoch, logs=None):
             row = dict(epoch=epoch+1, **{name: float(value) for name, value in (logs or {}).items()})
             rows.append(row)
-            _csv_atomic(pd.DataFrame(rows), folder / f'{code}_learning.csv')
+            write_table(pd.DataFrame(rows), folder / f'{code}_learning.json')
             update('epoch', symbol=symbol, epoch=epoch+1, max_epochs=epochs, **row_without_epoch(row))
 
     train, validation = splits['train'], splits['validation']
+    early_stopping = keras.callbacks.EarlyStopping(monitor='val_loss', patience=12, min_delta=.001,
+                                                   restore_best_weights=True)
     model.fit([xs[train], mask[train]], ys[train],
               validation_data=([xs[validation], mask[validation]], ys[validation]),
               epochs=epochs, batch_size=32, shuffle=False, verbose=0,
               callbacks=[EpochRecorder(), keras.callbacks.TerminateOnNaN(), keras.callbacks.ReduceLROnPlateau(monitor='val_loss', patience=4, factor=.5, min_lr=1e-6),
-                         keras.callbacks.EarlyStopping(monitor='val_loss', patience=12, min_delta=.001,
-                                                       restore_best_weights=True)])
+                         early_stopping])
     if not rows or not np.isfinite([row['loss'] for row in rows]).all():
         raise ValueError('Training did not complete with finite loss')
     model.save(folder / f'{code}_lstm.keras')
     scale = np.array(scaling['target_scale'])
     calibration = splits['calibration']
-    mu_cal, sigma_cal = decode(model.predict([xs[calibration], mask[calibration]], verbose=0), scale)
-    factors=np.ones(STEPS)
+    raw_cal=model.predict([xs[calibration],mask[calibration]],verbose=0)*scale
+    residual=y[calibration]-raw_cal
+    factors=np.array([max(float(np.nanstd(residual[:,j])),1e-6) if np.isfinite(residual[:,j]).sum()>=10 else 1. for j in range(STEPS)])
+    details['return_residual_scale']=factors.tolist()
+    supported=0
     for j in range(STEPS):
-        valid=np.isfinite(y[calibration,j])
-        if valid.sum()>=10:factors[j]=max(float(np.sqrt(np.mean(((y[calibration,j][valid]-mu_cal[valid,j])/sigma_cal[valid,j])**2))),.05)
+        if scaling['target_counts'][j]<20 or np.isfinite(residual[:,j]).sum()<10:break
+        supported+=1
+    details['supported_return_steps']=supported
+    np.savez_compressed(folder/f'{code}_residuals.npz',residuals=residual)
+    mu_cal=np.cumsum(raw_cal,axis=1)
+    sigma_cal=np.broadcast_to(np.sqrt(np.cumsum(factors**2)),mu_cal.shape)
+    # Evaluation uses compounded hourly returns; missing intermediate labels invalidate a path.
+    y=np.cumsum(y,axis=1)
+    factors=np.ones(STEPS)
     details.update(calibration_sigma_factor=factors.tolist(), epochs_completed=len(rows),
-                   best_epoch=int(np.argmin([row['val_loss'] for row in rows]))+1)
+                   best_epoch=int(early_stopping.best_epoch)+1,
+                   stop_reason='early_stopping' if early_stopping.stopped_epoch else 'epoch_limit',
+                   early_stopping=dict(monitor='val_loss', patience=12, min_delta=.001, restore_best_weights=True))
     _write_bytes_atomic(folder / f'{code}_preprocessing.json', json.dumps(details, ensure_ascii=False, indent=2))
     test = splits['test']
-    mu, sigma = decode(model.predict([xs[test], mask[test]], verbose=0), scale, factors)
-    latest_mu, latest_sigma = decode(model.predict([latest_scaled, latest_mask], verbose=0), scale, factors)
+    mu=np.cumsum(model.predict([xs[test],mask[test]],verbose=0)*scale,axis=1)
+    latest_mu=np.cumsum(model.predict([latest_scaled,latest_mask],verbose=0)*scale,axis=1)
+    sigma=np.broadcast_to(sigma_cal[0],mu.shape);latest_sigma=sigma_cal[:1]
+    paths=scenario_paths(np.diff(latest_mu[0],prepend=0),residual,latest_info['current_price'])
     predictions, metrics = [], []
     for column in range(STEPS):
-        day,hour=column//24+1,column%24
-        if hour not in latest_info['future_hours'] or scaling['target_counts'][column]<20 or np.isfinite(y[calibration,column]).sum()<10:continue
+
+        if column>=len(latest_info['forecast_slots']):continue
+        slot=latest_info['forecast_slots'][column];day,hour=slot['target_day'],slot['target_hour']
+        if day>21:continue
+        if hour not in latest_info['future_hours']:continue
+        if any(scaling['target_counts'][j]<20 or np.isfinite(residual[:,j]).sum()<10 for j in range(column+1)):
+            raise ValueError('Insufficient trained/calibrated hourly steps for a complete 21-session forecast')
         valid=np.isfinite(y[test,column])
-        if valid.sum()<10:continue
         horizon=column+1
         base = dict(model_kind='lstm', symbol=symbol, insCode=code, frequency='hourly', horizon=horizon,
-                    horizon_unit='hourly_slot', target_day=day, target_hour=hour, target_schema='hourly_path_v1', lookback_sessions=21)
+                    horizon_unit='hourly_slot', target_day=day, target_hour=hour, target_schema='hourly_returns_v3', lookback_sessions=21)
         forecast = price_distribution(latest_info['current_price'], float(latest_mu[0, column]), float(latest_sigma[0, column]))
         forecast.update(base, as_of=latest_info['as_of'], current_price=latest_info['current_price'],
                         mu_log=float(latest_mu[0, column]), sigma_log=float(latest_sigma[0, column]),
                         distribution='lognormal_price', direction='صعودی' if forecast['probability_up'] >= .5 else 'نزولی')
+        forecast.update(scenario_summary(paths[:,column],latest_info['current_price']))
+        forecast['direction']='صعودی' if forecast['probability_up']>=.5 else 'نزولی'
         forecast['lower90'] = forecast['lower_price']/forecast['current_price']-1
         forecast['upper90'] = forecast['upper_price']/forecast['current_price']-1
+        forecast['evaluation_available']=bool(valid.sum()>=10 and np.isfinite(y[calibration,column]).sum()>=10)
         predictions.append(forecast)
+        if not forecast['evaluation_available']:continue
         test_valid=test[valid]
         mu_step=mu[valid,column];sigma_step=sigma[valid,column]
         actual = np.expm1(y[test_valid, column])
@@ -127,11 +158,11 @@ def train_symbol(hourly, daily, symbol, code, folder, epochs, update, context_fr
         history['expanding_mae'] = abs(history.actual-history.predicted).expanding().mean()
         cal_sigma = sigma_cal[:, column]*factors[column]
         cal_valid=np.isfinite(y[calibration,column])
-        _csv_atomic(pd.DataFrame(dict(timestamp=metadata.iloc[calibration].as_of.to_numpy()[cal_valid],
+        write_table(pd.DataFrame(dict(timestamp=metadata.iloc[calibration].as_of.to_numpy()[cal_valid],
             current_price=metadata.iloc[calibration].current_price.to_numpy()[cal_valid],
             actual=np.expm1(y[calibration, column][cal_valid]), probability_up=ndtr(mu_cal[cal_valid, column]/cal_sigma[cal_valid]))),
-            folder / f'{code}_hourly_{horizon}_calibration.csv')
-        _csv_atomic(history, folder / f'{code}_hourly_{horizon}_test.csv')
+            folder / f'{code}_hourly_{horizon}_calibration.json')
+        write_table(history, folder / f'{code}_hourly_{horizon}_test.json')
         scores = dict(base, mae=float(np.mean(abs(actual-expected))), rmse=float(np.sqrt(np.mean((actual-expected)**2))),
                       direction_accuracy=float(np.mean((probability >= .5) == (actual > 0))),
                       brier=float(np.mean((probability-(actual > 0))**2)), coverage90=float(np.mean((actual >= lower)&(actual <= upper))),
@@ -153,18 +184,21 @@ def row_without_epoch(row):
     return {name: value for name, value in row.items() if name != 'epoch'}
 
 
-def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, workers=1, epochs=200, symbols=None, refresh_only=False):
+def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, workers=1, epochs=200, symbols=None, refresh_only=False, context_symbols=None):
     if not 1 <= epochs <= 200:
         raise ValueError('Epochs must be between 1 and 200')
     RUNS.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(RUNS / '.pipeline.lock'), timeout=0):
-        run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')+'-nn-'+uuid.uuid4().hex[:6]
+    with FileLock(str(RUNS / '.pipeline.lock'), timeout=0), (nullcontext() if refresh_only else FileLock(str(RUNS/'.models.lock'),timeout=0)):
+        from .model_management import new_model_identity
+        identity=new_model_identity(list(symbols or instruments()),list(instruments()) if context_symbols is None else list(dict.fromkeys(context_symbols)))
+        run_id=identity['run_id'] if not refresh_only else datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')+'-data-'+uuid.uuid4().hex[:6]
         previous = next((r for r in list_runs() if r.get('model_kind')=='lstm' and r.get('job_kind')!='data' and r['state'] in ('complete','partial')), None)
         folder = RUNS / run_id
         folder.mkdir()
-        if previous and (RUNS/previous['run_id']/'metrics.csv').exists():
-            shutil.copyfile(RUNS/previous['run_id']/'metrics.csv', folder/'baseline_metrics.csv')
+        if previous and table_path(RUNS/previous['run_id']/'metrics.json').exists():
+            write_table(read_table(RUNS/previous['run_id']/'metrics.json'),folder/'baseline_metrics.json')
         status = dict(label=('دریافت داده — ' if refresh_only else 'DeepLSTM 96×48 — ')+pd.Timestamp.now(tz='Asia/Tehran').strftime('%Y-%m-%d %H:%M تهران'), run_id=run_id, job_kind='data' if refresh_only else 'training', model_kind='lstm', state='running', stages=[], errors=[], warnings=[], started_at=datetime.now(timezone.utc).isoformat())
+        if not refresh_only:status.update(identity)
         store=None
 
         def update(stage, **details):
@@ -190,15 +224,15 @@ def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, wor
             import keras
             tf.config.threading.set_intra_op_parallelism_threads(2)
             tf.config.threading.set_inter_op_parallelism_threads(2)
-            for name in ['neural_data.py', 'hourly_data.py', 'neural_network.py', 'neural_training.py']:
+            for name in ['neural_data.py', 'hourly_data.py', 'return_data.py', 'scenarios.py', 'neural_network.py', 'neural_training.py']:
                 shutil.copyfile(Path(__file__).with_name(name), folder / name)
             _write_bytes_atomic(folder / 'environment.json', json.dumps(dict(python=sys.version,
                 packages=dict(tensorflow=tf.__version__, keras=keras.__version__, numpy=np.__version__,
                               pandas=pd.__version__, scipy=scipy.__version__),
-                model='LSTM96 -> LSTM48 -> Dense64 -> Dense32 -> Gaussian heads', direction_loss_weight=.2,
-                epochs=epochs, seed=42, batch_size=32, lookback_sessions=21, horizons=list(range(1,STEPS+1)), target_schema='hourly_path_v1',feature_schema='cross_asset_v2',
+                model='LSTM96 -> LSTM48 -> Dense64 -> Dense32 -> signed hourly returns', direction_loss_weight=.2,
+                epochs=epochs, seed=42, batch_size=32, lookback_sessions=21, horizons=list(range(1,STEPS+1)), target_schema='hourly_returns_v3',feature_schema='assets_eight_v1',
                 split='60/15/10/15 with max-horizon purge; calibration independent of early stopping',
-                refresh=refresh), indent=2))
+                refresh=refresh,context_symbols=context_symbols), indent=2))
             settings = Settings.from_env(BASE / '.env')
             if not settings.root.is_absolute():
                 settings = replace(settings, root=BASE / settings.root)
@@ -236,19 +270,25 @@ def run_neural_pipeline(refresh=True, max_hourly_days=0, full_history=False, wor
                     status['errors'].append(f'{symbol}: {exc}')
                     update('data_failed',symbol=symbol,error=str(exc))
             # Freeze context only AFTER every requested refresh, so all target networks see one consistent archive.
+            floor=history_start(store,settings)
             context_cache={}
             if not refresh_only:
-                for name,c in dict(instruments()).items():
-                    context_cache[c]=clean_context(store.load_hourly(c),store.load_daily(c),symbol=name,code=c)
+                known_contexts=dict(instruments())
+                if context_symbols is not None and any(name not in known_contexts for name in context_symbols):raise ValueError('Unknown context symbol; refresh selection before training')
+                selected_contexts=known_contexts if context_symbols is None else {name:known_contexts[name] for name in dict.fromkeys(context_symbols)}
+                for name,c in selected_contexts.items():
+                    context_cache[c]=clean_context(store.load_hourly(c,start=floor),store.load_daily(c,start=floor),symbol=name,code=c,include_closed_hours=True)
+                    if context_cache[c].empty:raise ValueError(f'{name}: no verified hourly context; download its hourly history or exclude it from training')
+                    context_cache[c].attrs['history_start']=floor
             for symbol,code in ([] if refresh_only else resolved.items()):
                 try:
-                    predictions, scores = train_symbol(store.load_hourly(code), store.load_daily(code), symbol, code, folder, epochs, update, context_frames=[frame for c,frame in context_cache.items() if c!=code])
+                    predictions, scores = train_symbol(store.load_hourly(code,start=floor), store.load_daily(code,start=floor), symbol, code, folder, epochs, update, context_frames=[frame for c,frame in context_cache.items() if c!=code])
                     for row in predictions:
                         row['run_id'] = run_id
                     results.extend(predictions)
                     metrics.extend(scores)
-                    _csv_atomic(pd.DataFrame(results), folder/'predictions.csv')
-                    _csv_atomic(pd.DataFrame(metrics), folder/'metrics.csv')
+                    write_table(pd.DataFrame(results), folder/'predictions.json')
+                    write_table(pd.DataFrame(metrics), folder/'metrics.json')
                     if hasattr(store,'record_results'):store.record_results(run_id,predictions,scores)
                 except Exception as exc:
                     status['errors'].append(f'{symbol}: {exc}')

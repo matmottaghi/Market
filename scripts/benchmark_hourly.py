@@ -4,15 +4,16 @@ from pathlib import Path
 import numpy as np,pandas as pd
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 from forecast.pipeline import RUNS
-root=RUNS/(sys.argv[1] if len(sys.argv)>1 else sorted(p.name for p in RUNS.glob('*-nn-*') if (p/'metrics.csv').exists())[-1])
-metrics=pd.read_csv(root/'metrics.csv',dtype={'insCode':str});results=[]
+from forecast.table_io import read_table,table_path
+root=RUNS/(sys.argv[1] if len(sys.argv)>1 else sorted(p.name for p in RUNS.glob('*-nn-*') if table_path(p/'metrics.json').exists())[-1])
+metrics=read_table(root/'metrics.json',dtype={'insCode':str});results=[]
 rng=np.random.default_rng(42)
 for symbol,group in metrics.groupby('symbol'):
  for day in (1,5,21):
   rows=group[group.target_day==day]
   if rows.empty:continue
   row=rows.sort_values('target_hour').iloc[-1]
-  history=pd.read_csv(root/f'{row.insCode}_hourly_{int(row.horizon)}_test.csv')
+  history=read_table(root/f'{row.insCode}_hourly_{int(row.horizon)}_test.json')
   delta=abs(history.actual.to_numpy())-abs(history.actual.to_numpy()-history.predicted.to_numpy())
   n=len(delta);block=min(21,n);bootstrap=[]
   for _ in range(1000):

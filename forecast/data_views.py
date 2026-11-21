@@ -2,9 +2,14 @@
 # preview_rows مقادیر منبع را با حفظ تفاوت قیمت پایانی/آخرین معامله برای جدول آماده می‌کند.
 from urllib.parse import urlencode
 import pandas as pd
-from django.shortcuts import render
-from django.http import HttpResponseBadRequest
+from django.shortcuts import render,redirect
+from django.http import HttpResponseBadRequest,HttpResponse
+from django.views.decorators.http import require_POST
+from django.views.decorators.csrf import csrf_protect
+from filelock import FileLock,Timeout
+from .pipeline import RUNS
 from .registry import settings_store,instruments,list_runs
+from market_data.history_scope import history_start
 
 QUALITY={'matched':'حجم همخوان','volume_mismatch':'حجم نامنطبق','missing':'بدون کندل','unverified':'تأییدنشده','mixed':'کیفیت ترکیبی'}
 
@@ -25,7 +30,8 @@ def preview_rows(rows,frequency):
     return result
 
 def data_page(request):
-    _,store=settings_store();known=instruments()
+    settings,store=settings_store();known=instruments()
+    scope_start=history_start(store,settings)
     symbol=request.GET.get('symbol','اهرم' if 'اهرم' in known else next(iter(known),''))
     if symbol and symbol not in known:return HttpResponseBadRequest('نماد در آرشیو ثبت نشده است')
     try:limit=int(request.GET.get('limit','10'))
@@ -49,7 +55,21 @@ def data_page(request):
             hourly=preview_rows(raw_hourly,'hourly')
             coverage=store.coverage_summary(code)
     jobs=[r for r in list_runs() if r.get('job_kind')=='data']
-    return render(request,'forecast/data.html',dict(symbols=known,symbol=symbol,inventory=inventory,selected=selected,
+    return render(request,'forecast/data.html',dict(deleted_symbol=request.GET.get('deleted',''),scope_start=scope_start,symbols=known,symbol=symbol,inventory=inventory,selected=selected,
         daily_rows=daily,hourly_rows=hourly,coverage=coverage,limit=limit,
         totals=dict(symbols=len(known),daily=sum(r['daily'] for r in inventory),hourly=sum(r['hourly'] for r in inventory),issues=sum(r['issues'] for r in inventory)),
         latest_daily=latest_daily,latest_hour=latest_hour,latest_job=jobs[0] if jobs else None))
+
+
+@require_POST
+@csrf_protect
+def delete_symbol_data(request):
+    _,store=settings_store()
+    symbol=request.POST.get('symbol','');code=request.POST.get('code','')
+    if store.list_instruments().get(symbol)!=code:
+        return HttpResponseBadRequest('نماد و شناسه با آرشیو تطبیق ندارند.')
+    try:
+        with FileLock(str(RUNS/'.pipeline.lock'),timeout=0),FileLock(str(store.root/'.market_sync.lock'),timeout=0):
+            store.delete_instrument(code)
+    except Timeout:return HttpResponse('تا پایان دریافت یا آموزش جاری منتظر بمانید.',status=409)
+    return redirect('/data/?'+urlencode(dict(deleted=symbol)))

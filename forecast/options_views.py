@@ -5,6 +5,7 @@ import json
 from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
+from .table_io import read_table,write_table,table_path,learning_tables
 import plotly.graph_objects as go
 from django.shortcuts import render,redirect
 from django.http import JsonResponse,HttpResponseBadRequest
@@ -15,6 +16,7 @@ from .registry import settings_store,instruments,list_runs
 from .pipeline import RUNS
 from .options_math import STRATEGIES,template_legs,evaluate_strategy
 from .views import plot
+from .availability import catalog,choose,load_rows,active_run
 
 def options_page(request):
     settings,store=settings_store();known=instruments()
@@ -27,26 +29,18 @@ def options_page(request):
     contracts=snapshot['contracts'] if snapshot else []
     expiries=sorted({c['expiry'] for c in contracts})
     expiry=data.get('expiry',expiries[0] if expiries else '')
-    runs=[r for r in list_runs() if (RUNS/r['run_id']/'predictions.csv').exists()]
-    run=next((r for r in runs if r['run_id']==data.get('run')),runs[0] if runs else None)
-    forecasts=[];forecast_metrics=None
-    if run and code:
-        frame=pd.read_csv(RUNS/run['run_id']/'predictions.csv',dtype={'insCode':str})
-        forecasts=frame[frame.insCode==code].to_dict('records')
-        if hasattr(store,'connect'):
-            with store.connect() as db:
-                rows=db.execute('SELECT payload FROM forecasts WHERE run=? AND code=? ORDER BY step',(run['run_id'],code)).fetchall()
-            if rows:forecasts=[json.loads(r[0]) for r in rows]
+    runs=catalog([r for r in list_runs() if r.get('job_kind')!='data'],RUNS,store)
+    run=choose(runs,code,data.get('run'),active_run(store,code))
+    forecasts=load_rows(run,code,RUNS,store);forecast_metrics=None
     try:step=int(data.get('step',forecasts[-1]['horizon'] if forecasts else 1))
     except ValueError:step=1
     if forecasts and step not in {p['horizon'] for p in forecasts}:step=forecasts[-1]['horizon']
     forecast=next((p for p in forecasts if p['horizon']==step),None)
-    if run and code and (RUNS/run['run_id']/'metrics.csv').exists():
-        scored=pd.read_csv(RUNS/run['run_id']/'metrics.csv',dtype={'insCode':str})
-        scored=scored[(scored.insCode==code)&(scored.horizon==step)]
-        if not scored.empty:
-            forecast_metrics=scored.iloc[0].to_dict()
-            forecast_metrics.update(mae_percent=100*forecast_metrics['mae'],accuracy_percent=100*forecast_metrics['direction_accuracy'],coverage_percent=100*forecast_metrics['coverage90'])
+    metric_rows=load_rows(run,code,RUNS,store,kind='forecast_metrics')
+    scored=[row for row in metric_rows if row['horizon']==step]
+    if scored:
+        forecast_metrics=scored[0]
+        forecast_metrics.update(mae_percent=100*forecast_metrics['mae'],accuracy_percent=100*forecast_metrics['direction_accuracy'],coverage_percent=100*forecast_metrics['coverage90'])
     rawlegs=data.get('legs','')
     fees=data.get('fees','0');capital=data.get('capital','')
     if request.method=='POST' and data.get('build')!='select_model':

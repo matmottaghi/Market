@@ -37,8 +37,23 @@ def build_network(feature_count, seed=42, horizon_count=3):
     hidden = keras.layers.Dense(64, activation='swish', kernel_regularizer=keras.regularizers.l2(.0001))(hidden)
     hidden = keras.layers.Dropout(.25)(hidden)
     hidden = keras.layers.Dense(32, activation='swish')(hidden)
-    output = keras.layers.Dense(horizon_count*2, name='log_return_distribution')(hidden)
+    output = keras.layers.Dense(horizon_count, name='signed_hourly_return')(hidden)
     model = keras.Model([values, mask], output, name='DeepLSTM_21_sessions')
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=.0005, clipnorm=1),
-                  loss=gaussian_nll, metrics=[standardized_mae])
+                  loss=return_loss, metrics=[return_mae])
     return model
+
+
+@keras.saving.register_keras_serializable(package='Market')
+def return_loss(y_true, y_pred):
+    count=y_pred.shape[-1]
+    target=y_true[:,:count];mask=y_true[:,count:] if y_true.shape[-1]==2*count else keras.ops.ones_like(y_pred)
+    # Preserve the direction weight while learning signed returns directly.
+    direction=keras.ops.binary_crossentropy(keras.ops.cast(target>0,'float32'),keras.ops.sigmoid(y_pred))
+    error=keras.ops.square(target-y_pred)+.2*direction
+    return keras.ops.sum(error*mask,axis=-1)/keras.ops.maximum(keras.ops.sum(mask,axis=-1),1)
+
+@keras.saving.register_keras_serializable(package='Market')
+def return_mae(y_true,y_pred):
+    count=y_pred.shape[-1];mask=y_true[:,count:] if y_true.shape[-1]==2*count else keras.ops.ones_like(y_pred)
+    return keras.ops.sum(keras.ops.abs(y_true[:,:count]-y_pred)*mask,axis=-1)/keras.ops.maximum(keras.ops.sum(mask,axis=-1),1)

@@ -1,0 +1,20 @@
+<article id="training-report" class="training-report" aria-labelledby="training-report-title">
+  <h3 id="training-report-title">مشخصات داده و شبکهٔ آموزش {{ symbol }}</h3>
+  <p>گزارش اجرای انتخاب‌شده: {{ current.label|default:'بدون اجرای انتخابی' }}. اطلاعات از مشخصات ثبت‌شدهٔ همین مدل خوانده می‌شود؛ افزودن سهم یا دادهٔ تازه به آرشیو، این گزارش را تغییر نمی‌دهد.</p>
+  {% if training_report.available %}
+  {% if training_report.warning %}<p class="warning">{{ training_report.warning }}</p>{% endif %}
+  <div class="cards">
+    <div class="card">بازهٔ زمانی نقاط مبنای آموزش<strong class="small">از {{ training_report.train_boundary.first|default:'ثبت نشده' }}<br>تا {{ training_report.train_boundary.last|default:'ثبت نشده' }}</strong></div>
+    <div class="card">بازهٔ دادهٔ ورودی بخش آموزش<strong class="small">از {{ training_report.input_period.first|default:'ثبت نشده' }}<br>تا {{ training_report.input_period.last|default:'ثبت نشده' }}</strong></div>
+    <div class="card">تعداد سهم‌های ورودی<strong>{{ training_report.asset_count|default_if_none:'ثبت نشده' }}</strong></div>
+    <div class="card">Time window شبکه<strong>{{ training_report.lookback|default_if_none:'ثبت نشده' }} جلسه</strong><small>دنبالهٔ ساعت‌های معتبر در پنجرهٔ ورودی</small></div>
+    <div class="card">افق پیش‌بینی<strong>{% if training_report.forecast_sessions %}تا {{ training_report.forecast_sessions }} جلسه{% else %}ثبت نشده{% endif %}</strong><small>{% if training_report.hourly %}خروجی در ساعت‌های معاملاتی؛ ساعت فاقد خروجی نمایش داده نمی‌شود.{% endif %}</small></div>
+    <div class="card">ابعاد هر نمونهٔ ورودی<strong class="small" dir="ltr">{{ training_report.steps|default_if_none:'—' }} × {{ training_report.features|default_if_none:'—' }}</strong><small>گام زمانی × ویژگی</small></div>
+  </div>
+  <div class="table-wrap"><table aria-label="تقسیم داده‌های اجرای انتخابی"><thead><tr><th>بخش داده</th><th>تعداد نمونه</th><th>اولین نقطهٔ مبنا</th><th>آخرین نقطهٔ مبنا</th><th>پایان آخرین هدف آینده</th></tr></thead><tbody>{% for part in training_report.splits %}<tr><td>{{ part.label }}</td><td>{{ part.count|default_if_none:'ثبت نشده' }}</td><td>{{ part.first|default:'ثبت نشده' }}</td><td>{{ part.last|default:'ثبت نشده' }}</td><td>{{ part.target_end|default:'ثبت نشده' }}</td></tr>{% endfor %}</tbody></table></div>
+  <p>تعدادها، تعداد پنجره‌های نمونه پس از جداسازی زمانی و حذف نمونه‌های دارای هم‌پوشانی هدف بین بخش‌ها هستند؛ تعداد ردیف خام یا تعداد معامله نیستند. کالیبراسیون برای برآورد عدم‌قطعیت جدا نگه داشته می‌شود. تعداد نمونه‌های معتبرِ آزمون یک افق ممکن است به‌علت نبود برچسب کمتر از تعداد پنجره‌های آزمون باشد.</p>
+  <p>ابعاد کل دادهٔ آماده: <bdi dir="ltr">{{ training_report.shape_text|default:'ثبت نشده' }}</bdi> (نمونه × گام زمانی × ویژگی). این مجموعه می‌تواند نمونه‌های کنارگذاشته‌شده بین بخش‌ها را هم شامل شود. طول دنباله‌ها با padding یکسان شده و گام‌های اضافی ماسک دارند. تعداد خروجی‌های تعریف‌شدهٔ شبکه: {{ training_report.output_count|default_if_none:'ثبت نشده' }}؛ این عدد تعداد ساعت‌های تضمین‌شدهٔ قابل نمایش نیست.</p>
+  <h4>سهم هدف و سهم‌های زمینهٔ استفاده‌شده در آموزش</h4>
+  <div class="training-assets">{% for asset in training_report.assets %}<span class="pill">{{ asset.name }}{% if asset.target %} · سهم هدف{% else %} · زمینه{% endif %}</span>{% empty %}<span>فهرست سهم‌های ورودی برای این اجرا ثبت نشده است.</span>{% endfor %}</div>
+  {% else %}<p class="empty">{% if training_report.warning %}{{ training_report.warning }}{% else %}مشخصات آماده‌سازی این سهم در اجرای انتخاب‌شده هنوز ثبت نشده است. پس از آماده‌سازی دادهٔ آموزش، گزارش اینجا نمایش داده می‌شود.{% endif %}</p>{% endif %}
+</article>

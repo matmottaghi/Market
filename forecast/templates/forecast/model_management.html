@@ -1,0 +1,8 @@
+<article id="model-management" class="training-report">
+<h3>مدیریت مدل‌های موجود و ذخیره‌شده</h3>
+{% if model_deleted %}<p class="warning" role="status">مدل و نتایج آن از فهرست فعال حذف شد؛ نسخهٔ بازیابی نگهداری شده است.</p>{% endif %}
+<p>شناسهٔ نمایشی: تاریخ · ساعت تهران · سهم هدف · تعداد سهم‌های زمینه (بدون سهم هدف). نام دلخواه ذخیره‌شده کنار این مشخصات می‌آید. «خروجی تاریخی» یعنی وزن مدل دیگر موجود نیست.</p>
+<div class="table-wrap"><table><thead><tr><th>شناسه / نام مدل</th><th>سهم هدف</th><th>تعداد سهم زمینه</th><th>وضعیت اجرا</th><th>نگهداری</th><th>وزن مدل</th><th>مدیریت</th></tr></thead><tbody>
+{% for m in model_management %}<tr><td>{{ m.display_label }}<small class="data-subtext" dir="ltr">{{ m.run_id }}</small></td><td>{{ m.targets|join:'، '|default:'ثبت نشده' }}</td><td>{{ m.context_description }}</td><td>{{ m.state }}</td><td>{% if m.active %}فعال در بازار · {% endif %}{% if m.saved %}ذخیره‌شده{% else %}ذخیره‌نشده{% endif %}</td><td>{% if m.has_weights %}موجود{% else %}خروجی تاریخی / بدون وزن{% endif %}</td><td><a href="/training/?run={{ m.run_id|urlencode }}{% if m.targets %}&symbol={{ m.targets.0|urlencode }}{% endif %}#result">مشاهده</a><details><summary>حذف مدل</summary><p>وزن‌ها، نتایج پیش‌بینی، معیارها و انتخاب فعال این اجرا حذف می‌شوند؛ داده‌های روزانه و ساعتی سهم‌ها باقی می‌مانند.</p><form method="post" action="{% url 'delete_model' %}">{% csrf_token %}<input type="hidden" name="run" value="{{ m.run_id }}"><button class="danger" {% if m.state == 'running' %}disabled{% endif %}>حذف این مدل و نتایج</button></form></details></td></tr>{% empty %}<tr><td colspan="7">هنوز مدلی در آرشیو وجود ندارد. یک آموزش تازه شروع کنید.</td></tr>{% endfor %}
+</tbody></table></div>
+</article>

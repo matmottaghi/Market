@@ -1,9 +1,13 @@
 # توضیح فایل: آزمون نگهداری انتخابی مدل، تقویم شمسی، SSE و دو تب با دادهٔ واقعی/ساختگی.
 # توابع test_retention حفظ منتخب، test_jalali مرز ماه، test_stream قرارداد استریم و test_panels مسیرهای پنل را بررسی می‌کنند.
+# آزمون‌های training انتخاب دقیقاً یک هدف ثبت‌شده و خواندن صرفاً از دیتابیس را کنترل می‌کنند؛ درخواست refresh از آموزش رد می‌شود.
 import json
 import os
+import pandas as pd
+import pytest
 from datetime import date
 from forecast.registry import prune, jalali_month
+from forecast.table_io import write_table
 
 def test_retention(tmp_path):
     for name, saved in [('old',False),('selected',True),('latest',False)]:
@@ -38,7 +42,7 @@ def test_save_selected_symbol(monkeypatch,tmp_path):
     (p/'status.json').write_text(json.dumps(dict(run_id='run',state='complete',model_kind='lstm')))
     (p/'11111_lstm.keras').write_text('fixture')
     (p/'11111_preprocessing.json').write_text(json.dumps({'calibration_sigma_factor':[1]}))
-    (p/'predictions.csv').write_text('insCode\n11111\n')
+    write_table(pd.DataFrame({'insCode':['11111']}),p/'predictions.json')
     monkeypatch.setattr(views,'RUNS',tmp_path)
     monkeypatch.setattr(views,'instruments',lambda:{'توان':'11111'})
     response=views.retain(RequestFactory().post('/retain/',dict(run='run',scope='symbol',symbol='توان',action='save',name='منتخب')))
@@ -67,7 +71,7 @@ def test_panels():
         assert result.status_code==200
         assert 'آموزش و ارزیابی مدل'.encode() in result.content
 
-def test_refresh_forces_online(monkeypatch,tmp_path):
+def test_training_page_cannot_refresh_data(monkeypatch,tmp_path):
     os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
     import django;django.setup()
     from forecast import views
@@ -77,5 +81,54 @@ def test_refresh_forces_online(monkeypatch,tmp_path):
     calls=[]
     monkeypatch.setattr(views.subprocess,'Popen',lambda args,**kwargs:calls.append(args))
     response=views.launch(RequestFactory().post('/run/',dict(epochs=200, symbols=['توان'],offline='on',action='refresh')))
+    assert response.status_code==400 and calls==[]
+
+
+@pytest.mark.parametrize('fields',[
+    {}, {'target_symbol':['توان','اهرم']}, {'symbols':['توان','اهرم']},
+    {'target_symbol':'ناشناس'}, {'target_symbol':'توان','new_symbols':'موج'},
+])
+def test_training_rejects_missing_multiple_or_unregistered_targets(monkeypatch,tmp_path,fields):
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+    import django;django.setup()
+    from forecast import views
+    from django.test import RequestFactory
+    monkeypatch.setattr(views,'RUNS',tmp_path)
+    monkeypatch.setattr(views,'instruments',lambda:{'توان':'11111','اهرم':'22222'})
+    calls=[]
+    monkeypatch.setattr(views.subprocess,'Popen',lambda args,**kwargs:calls.append(args))
+    response=views.launch(RequestFactory().post('/run/',dict(action='train',**fields)))
+    assert response.status_code==400 and calls==[]
+
+
+@pytest.mark.parametrize('field',['target_symbol','symbols'])
+def test_single_target_training_always_uses_database(monkeypatch,tmp_path,field):
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+    import django;django.setup()
+    from forecast import views
+    from django.test import RequestFactory
+    monkeypatch.setattr(views,'RUNS',tmp_path)
+    monkeypatch.setattr(views,'instruments',lambda:{'توان':'11111','اهرم':'22222'})
+    calls=[]
+    monkeypatch.setattr(views.subprocess,'Popen',lambda args,**kwargs:calls.append(args))
+    response=views.launch(RequestFactory().post('/run/',dict(action='train',**{field:'اهرم'})))
+    assert response.status_code==302 and response.url.startswith('/training/?symbol=')
+    args=calls[0]
+    assert args[args.index('--symbols')+1:]==['اهرم','--offline']
+    assert '--refresh-only' not in args
+
+
+def test_data_refresh_can_explicitly_backfill_full_history(monkeypatch,tmp_path):
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+    import django;django.setup()
+    from forecast import views
+    from django.test import RequestFactory
+    monkeypatch.setattr(views,'RUNS',tmp_path)
+    monkeypatch.setattr(views,'instruments',lambda:{'اهرم':'11111'})
+    calls=[]
+    monkeypatch.setattr(views.subprocess,'Popen',lambda args,**kwargs:calls.append(args))
+    response=views.launch(RequestFactory().post('/run/',dict(next='/data/',action='refresh',symbols=['اهرم'],hourly_days=0,full_history='1')))
     assert response.status_code==302
-    assert '--refresh-only' in calls[0] and '--offline' not in calls[0]
+    assert '--full-history' in calls[0] and '--refresh-only' in calls[0]
+    assert calls[0][calls[0].index('--hourly-days')+1]=='0'
+    assert '--offline' not in calls[0]

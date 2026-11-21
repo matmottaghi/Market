@@ -1,6 +1,6 @@
 # توضیح فایل: دو پنل آموزش و بازار، جریان SSE، انتخاب نماد/اجرا، ذخیره مدل و دریافت داده.
 # توابع plot قالب نمودار و events مولد رویداد SSE هستند.
-# توابع: dashboard نمودار؛ stream پیشرفت؛ launch شروع worker؛ retain نگهداری؛ download_model بستهٔ وزن و scaler؛ refresh_prediction/prediction_status پیش‌بینی تازه و وضعیت.
+# توابع: dashboard نمودار؛ stream پیشرفت؛ launch آموزش تک‌هدف آفلاین یا دریافت مستقل از پنل داده؛ retain نگهداری؛ download_model بستهٔ وزن و scaler؛ refresh_prediction/prediction_status پیش‌بینی تازه و وضعیت.
 import json
 import os
 import subprocess
@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
+from .table_io import read_table,write_table,table_path,learning_tables
 import plotly.graph_objects as go
-from scipy.stats import lognorm
 from django.http import StreamingHttpResponse, HttpResponseBadRequest, HttpResponse, FileResponse, JsonResponse
 from django.shortcuts import render, redirect
 from django.views.decorators.http import require_POST
@@ -19,6 +19,10 @@ from filelock import FileLock, Timeout
 from .pipeline import BASE, RUNS
 from .registry import list_runs, prune, instruments, settings_store, jalali_month
 from .neural_data import price_distribution
+from .availability import catalog,choose,load_rows,active_run,reusable
+from .training_report import training_report
+from .model_management import model_records,delete_model_run,model_mutation_lock
+from django.views.decorators.csrf import csrf_protect
 from market_data.csv_store import _write_bytes_atomic
 
 def plot(fig, title):
@@ -31,18 +35,33 @@ def dashboard(request):
     known = instruments()
     symbol = request.GET.get('symbol', next(iter(known), 'توان'))
     if not request.GET.get('symbol') and current:
-        path=RUNS/current['run_id']/'predictions.csv'
+        path=table_path(RUNS/current['run_id']/'predictions.json')
         if path.exists():
-            available=pd.read_csv(path,usecols=['symbol'])
+            available=read_table(path,usecols=['symbol'])
             if not available.empty:symbol=available.symbol.iloc[0]
         else:symbol=current.get('training_progress',{}).get('symbol','توان' if 'توان' in known else symbol)
-    if not request.GET.get('run') and request.path.startswith('/market') and symbol in known:
-        _,active_store=settings_store()
-        if hasattr(active_store,'connect'):
-            with active_store.connect() as db: active=db.execute('SELECT manifest FROM model_registry WHERE id=?',('active:'+known[symbol],)).fetchone()
-            if active:
-                active_id=json.loads(active[0])['run_id']
-                current=next((r for r in runs if r['run_id']==active_id),current)
+    _,availability_store=settings_store()
+    runs=catalog(runs,RUNS,availability_store)
+    current=next((r for r in runs if r['run_id']==request.GET.get('run')),current)
+    notice=''
+    if request.path.startswith('/market'):
+        requested=request.GET.get('run')
+        current=choose(runs,known.get(symbol),requested,active_run(availability_store,known.get(symbol)))
+        if current and requested and current['run_id']!=requested:
+            notice='اجرای انتخابی برای این نماد خروجی نداشت؛ آخرین اجرای دارای پیش‌بینی این نماد نمایش داده شد.'
+    else:
+        ready=choose(runs,known.get(symbol),request.GET.get('run'))
+        preparing=current and current.get('state')=='running' and any(s.get('symbol')==symbol for s in current.get('stages',[]))
+        if ready and not preparing and (not current or known.get(symbol) not in current.get('ready_codes',set())):
+            current=ready;notice='اجرای دارای خروجی این نماد برای ارزیابی انتخاب شد.'
+    management=model_records(RUNS,availability_store,runs,known)
+    labels={r['run_id']:r['display_label'] for r in management}
+    for r in runs:r['display_label']=labels.get(r['run_id'],r.get('label',r['run_id']))
+    can_predict=reusable(RUNS,current,known.get(symbol))
+    if current and not can_predict and known.get(symbol) in current.get('ready_codes',set()) and not (RUNS/current['run_id']/f"{known.get(symbol)}_lstm.keras").exists():
+        notice+=' خروجی تاریخی ذخیره‌شده نمایش داده می‌شود؛ وزن این مدل نگهداری نشده و پیش‌بینی تازه با آن ممکن نیست.'
+    empty_reason='' if current and known.get(symbol) in current.get('ready_codes',set()) else 'برای این نماد در اجرای انتخابی هنوز پیش‌بینی آماده نیست. داشتن داده یا حضور در زمینهٔ بازار، به معنی آموزش مدل مستقل آن نماد نیست.'
+    symbol_options=[dict(name=n,ready=any(c in r.get('ready_codes',set()) for r in runs)) for n,c in known.items()]
     try:horizon=max(1,min(504,int(request.GET.get('horizon','1'))))
     except ValueError:horizon=1
     try:
@@ -59,60 +78,71 @@ def dashboard(request):
     if decision_source not in ('test','calibration'):decision_source='calibration'
     if current:
         folder=RUNS/current['run_id']
-        pp=folder/'predictions.csv'; mm=folder/'metrics.csv'
-        if pp.exists():
-            frame=pd.read_csv(pp,dtype={'insCode':str});predictions=frame[frame.symbol==symbol].to_dict('records')
-        if request.path.startswith('/market') and symbol in known:
-            _,forecast_store=settings_store()
-            if hasattr(forecast_store,'connect'):
-                with forecast_store.connect() as db:
-                    latest_rows=db.execute('SELECT payload FROM forecasts WHERE run=? AND code=? ORDER BY step',(current['run_id'],known[symbol])).fetchall()
-                if latest_rows:predictions=[json.loads(r[0]) for r in latest_rows]
-        if predictions and predictions[0].get('target_schema')=='hourly_path_v1':
-            predictions=[p for p in predictions if p['target_day']<=days]
+        pp=table_path(folder/'predictions.json'); mm=table_path(folder/'metrics.json')
+        if request.path.startswith('/market'):
+            predictions=load_rows(current,known.get(symbol),RUNS,availability_store)
+        elif pp.exists():
+            frame=read_table(pp,dtype={'insCode':str});predictions=frame[frame.symbol==symbol].to_dict('records')
+        if request.path.startswith('/market') and any(p.get('target_schema')=='hourly_returns_v2' for p in predictions):
+            predictions=[]
+            empty_reason='این مدل با برنامهٔ ساعت‌های تاریخی نادرست آموزش دیده و افق کامل ۲۱ جلسه ندارد؛ برای پیش‌بینی معتبر باید مدل نسخهٔ جدید را دوباره آموزش دهید.'
+            can_predict=False
+        if predictions and predictions[0].get('target_schema') in ('hourly_path_v1','hourly_returns_v2','hourly_returns_v3'):
+            predictions=[p for p in predictions if p['target_day']<= (21 if request.path.startswith('/market') else days)]
             prediction_steps=[dict(value=p['horizon'],label=f"جلسه {p['target_day']} — ساعت {int(p['target_hour']):02d}") for p in predictions]
             if horizon not in [p['horizon'] for p in predictions]:horizon=predictions[-1]['horizon'] if predictions else 1
         for row in predictions:
-            row.update(price_distribution(row['current_price'],row['mu_log'],row['sigma_log'],confidence))
+            if row.get('scenario_prices'):
+                from .scenarios import scenario_summary
+                row.update(scenario_summary(row['scenario_prices'],row['current_price'],confidence))
+            else:row.update(price_distribution(row['current_price'],row['mu_log'],row['sigma_log'],confidence))
             row['return_percent']=row['predicted_return']*100
             row['probability_up_percent']=row['probability_up']*100
             row['probability_down_percent']=row['probability_down']*100
-        if mm.exists():
-            frame=pd.read_csv(mm);metrics=frame[(frame.symbol==symbol)&(frame.horizon==horizon)].to_dict('records')
+        metric_rows=load_rows(current,known.get(symbol),RUNS,availability_store,kind='forecast_metrics')
+        if metric_rows:
+            metrics=[m for m in metric_rows if m['horizon']==horizon]
             if metrics:
                 m=metrics[0]
                 cards=[('دقت جهت آزمون',f"{100*m['direction_accuracy']:.1f}%"),('MAE بازده',f"{100*m['mae']:.2f}%"),('RMSE',f"{100*m['rmse']:.2f}%"),('Brier',f"{m['brier']:.3f}"),('پوشش بازه ۹۰٪',f"{100*m['coverage90']:.1f}%"),('تعداد آزمون',str(m['test_rows']))]
-                baseline=folder/'baseline_metrics.csv'
+                baseline=table_path(folder/'baseline_metrics.json')
                 if baseline.exists():
-                    old=pd.read_csv(baseline)
+                    old=read_table(baseline)
                     selected=old[(old.symbol==symbol)&(old.horizon==horizon)]
                     if not selected.empty:
                         gain=100*(selected.iloc[0].mae-m['mae'])
                         cards.append(('بهبود MAE نسبت اجرای قبل',f'{gain:+.2f} واحد درصد'))
-        if predictions and predictions[0].get('target_schema')=='hourly_path_v1':
+        if predictions and predictions[0].get('target_schema') in ('hourly_path_v1','hourly_returns_v2','hourly_returns_v3'):
             for day in range(1,days+1):
                 rows=[p for p in predictions if p['target_day']==day]
                 if rows:day_forecasts.append(max(rows,key=lambda p:p['target_hour']))
         code=known.get(symbol)
         if code:
-            path=folder/f'{code}_learning.csv'
-            if path.exists():
-                df=pd.read_csv(path)
-                for cols,title in [(['loss','val_loss'],'زیان ترکیبی آموزش / اعتبارسنجی'),(['standardized_mae','val_standardized_mae'],'خطای استانداردشده')]:
+            path=table_path(folder/f'{code}_learning.json')
+            df=read_table(path) if path.exists() else pd.DataFrame()
+            if df.empty and hasattr(availability_store,'connect'):
+                with availability_store.connect() as db:
+                    rows=db.execute('SELECT payload FROM epoch_metrics WHERE run=? AND code=? ORDER BY epoch',(current['run_id'],code)).fetchall()
+                df=pd.DataFrame([json.loads(r[0]) for r in rows])
+            if not df.empty:
+                for cols,title in [(['loss','val_loss'],'زیان ترکیبی آموزش / اعتبارسنجی'),(['standardized_mae','val_standardized_mae','return_mae','val_return_mae'],'خطای استانداردشده')]:
                     fig=go.Figure()
                     for col in cols:
                         if col in df:fig.add_scatter(x=df.epoch,y=df[col],name=col)
                     config=folder/f'{code}_preprocessing.json'
+                    best=None
                     if config.exists():
                         best=json.loads(config.read_text(encoding='utf8')).get('best_epoch')
-                        if best:fig.add_vline(x=best,line_dash='dot',annotation_text='بهترین epoch')
+                    else:
+                        best=next((s.get('best_epoch') for s in current.get('stages',[]) if s.get('stage')=='trained' and s.get('symbol')==symbol),None)
+                    if best:fig.add_vline(x=best,line_dash='dot',annotation_text='بهترین epoch')
                     learning_charts.append(plot(fig,f'{symbol} — {title}'))
-            path=folder/f'{code}_hourly_{horizon}_{decision_source}.csv'
+            path=table_path(folder/f'{code}_hourly_{horizon}_{decision_source}.json')
             if path.exists():
-                df=pd.read_csv(path);decision=[dict(p=float(r.probability_up),actual=int(r.actual>0),t=str(r.timestamp),price=float(r.current_price) if hasattr(r,'current_price') else None) for r in df.itertuples()]
-            path=folder/f'{code}_hourly_{horizon}_test.csv'
+                df=read_table(path);decision=[dict(p=float(r.probability_up),actual=int(r.actual>0),t=str(r.timestamp),price=float(r.current_price) if hasattr(r,'current_price') else None) for r in df.itertuples()]
+            path=table_path(folder/f'{code}_hourly_{horizon}_test.json')
             if path.exists():
-                df=pd.read_csv(path);fig=go.Figure()
+                df=read_table(path);fig=go.Figure()
                 fig.add_scatter(x=df.timestamp,y=df.actual*100,name='بازده واقعی')
                 fig.add_scatter(x=df.timestamp,y=df.predicted*100,name='بازده پیش‌بینی')
                 charts.append(plot(fig,f'{symbol} — بازده تاریخی افق انتخابی'))
@@ -123,18 +153,6 @@ def dashboard(request):
                         part=df[good==correct];price_fig.add_scatter(x=part.timestamp,y=part.current_price,mode='markers',marker=dict(color=color,size=8),name=label)
                     charts.append(plot(price_fig,'محل تصمیم‌های خارج از آموزش روی قیمت'))
     chosen=next((p for p in predictions if p['horizon']==horizon),None)
-    if predictions:
-        fig=go.Figure()
-        rows=sorted(predictions,key=lambda p:p['horizon'])
-        for key,label in [('upper_price','حد بالا'),('lower_price','حد پایین'),('predicted_price','قیمت مورد انتظار')]:
-            fig.add_scatter(x=[f"روز {p.get('target_day',p['horizon'])} · {int(p.get('target_hour',0)):02d}" for p in rows],y=[p[key] for p in rows],name=label,fill='tonexty' if key=='lower_price' else None)
-        forecast_charts.append(plot(fig,f'{symbol} — بازه قیمت {confidence*100:g}٪'))
-    if chosen:
-        x=np.linspace(lognorm.ppf(.005,chosen['sigma_log'],scale=chosen['current_price']*np.exp(chosen['mu_log'])),lognorm.ppf(.995,chosen['sigma_log'],scale=chosen['current_price']*np.exp(chosen['mu_log'])),250)
-        fig=go.Figure(go.Scatter(x=x,y=lognorm.pdf(x,chosen['sigma_log'],scale=chosen['current_price']*np.exp(chosen['mu_log'])),fill='tozeroy',name='چگالی قیمت'))
-        fig.add_vline(x=chosen['lower_price'],line_dash='dot');fig.add_vline(x=chosen['upper_price'],line_dash='dot')
-        label=f"جلسه {chosen['target_day']}، ساعت {int(chosen['target_hour']):02d}" if chosen.get('target_schema')=='hourly_path_v1' else f'{horizon} روز معاملاتی'
-        forecast_charts.append(plot(fig,f'توزیع قیمت — {label}'))
     seasonality=[]; history=[]
     _,store=settings_store()
     if symbol in known:
@@ -154,8 +172,10 @@ def dashboard(request):
             daily['month']=pd.to_datetime(daily.Date).map(jalali_month)
             group=daily.groupby('month').ret.agg(['mean','count']).reindex(range(1,13))
             seasonality.append(plot(go.Figure(go.Bar(x=['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'],y=group['mean'],customdata=group['count'],hovertemplate='%{x}: %{y:.2f}% — تعداد %{customdata}')),'میانگین بازده روزانه در ماه‌های شمسی (همه سال‌ها)'))
+    report=training_report(RUNS/current['run_id'],known.get(symbol),symbol,current) if current and not request.path.startswith('/market') else None
+    market_forecast=dict(symbol=symbol,horizon=horizon,confidence=confidence,rows=sorted(predictions,key=lambda p:p['horizon']))
     inventory=store.inventory() if hasattr(store,'inventory') else []
-    return render(request,'forecast/dashboard.html',dict(inventory=inventory,days=days,prediction_steps=prediction_steps,day_forecasts=day_forecasts,page='market' if request.path.startswith('/market') else 'train',runs=runs,current=current,symbols=known,symbol=symbol,horizon=horizon,confidence_percent=confidence*100,confidence_error=confidence_error,predictions=predictions,chosen=chosen,metrics=metrics,cards=cards,learning_charts=learning_charts,charts=charts,forecast_charts=forecast_charts,seasonality=seasonality,history=history,decision=decision,decision_source=decision_source))
+    return render(request,'forecast/dashboard.html',dict(model_management=management,model_deleted=request.GET.get('model_deleted'),training_report=report,market_forecast=market_forecast,notice=notice,empty_reason=empty_reason,can_predict=can_predict,symbol_options=symbol_options,inventory=inventory,days=days,prediction_steps=prediction_steps,day_forecasts=day_forecasts,page='market' if request.path.startswith('/market') else 'train',runs=runs,current=current,symbols=known,symbol=symbol,horizon=horizon,confidence_percent=confidence*100,confidence_error=confidence_error,predictions=predictions,chosen=chosen,metrics=metrics,cards=cards,learning_charts=learning_charts,charts=charts,forecast_charts=forecast_charts,seasonality=seasonality,history=history,decision=decision,decision_source=decision_source))
 
 def stream(request):
     def events():
@@ -164,8 +184,8 @@ def stream(request):
             state=rows[0] if rows else {'state':'idle'}
             curves={}
             if rows:
-                for p in (RUNS/rows[0]['run_id']).glob('*_learning.csv'):
-                    curves[p.stem.replace('_learning','')]=pd.read_csv(p).fillna(0).to_dict('records')
+                for p in learning_tables(RUNS/rows[0]['run_id']):
+                    curves[p.stem.replace('_learning','')]=read_table(p).fillna(0).to_dict('records')
             yield 'data: '+json.dumps(dict(status=state,curves=curves),ensure_ascii=False)+'\n\n'
             time.sleep(2)
     response=StreamingHttpResponse(events(),content_type='text/event-stream')
@@ -178,9 +198,20 @@ def launch(request):
         data_request=request.POST.get('next')=='/data/' and request.POST.get('action')=='refresh'
         epochs=int(request.POST.get('epochs','200'))
         if not 1<=epochs<=200:raise ValueError()
-        symbols=request.POST.getlist('symbols') or ([] if data_request else list(instruments()))
-        extra=request.POST.get('new_symbols','').replace('،',',').split(',')
-        symbols=list(dict.fromkeys(symbols+[s.strip() for s in extra if s.strip()]))
+        if data_request:
+            symbols=request.POST.getlist('symbols')
+        else:
+            if request.POST.get('action','train')!='train':
+                return HttpResponseBadRequest('به‌روزرسانی داده فقط از تب داده‌های من انجام می‌شود.')
+            symbols=request.POST.getlist('target_symbol') or request.POST.getlist('symbols')
+            if len(symbols)!=1 or request.POST.get('new_symbols','').strip():
+                return HttpResponseBadRequest('برای هر آموزش دقیقاً یک سهم هدف ثبت‌شده انتخاب کنید.')
+            if symbols[0] not in instruments():return HttpResponseBadRequest('ابتدا نماد را در تب داده‌های من ثبت و داده‌های آن را دریافت کنید.')
+            context_mode=request.POST.get('context_mode','all')
+            if context_mode not in ('all','selected','none'):raise ValueError()
+            context_symbols=list(dict.fromkeys(request.POST.getlist('context_symbols'))) if context_mode=='selected' else []
+            if context_mode=='selected' and not context_symbols:return HttpResponseBadRequest('حداقل یک سهم زمینه انتخاب کنید یا حالت فقط سهم هدف را بزنید.')
+            if any(name not in instruments() for name in context_symbols):raise ValueError()
         if not symbols or any(len(s)>60 or '/' in s or '\\' in s for s in symbols):raise ValueError()
         if data_request:
             if any(s not in instruments() for s in symbols):raise ValueError()
@@ -191,16 +222,19 @@ def launch(request):
     try:
         with FileLock(str(RUNS/'.pipeline.lock'),timeout=0):
             args=[sys.executable,str(BASE/'manage.py'),'train_forecast','--epochs',str(epochs),'--symbols',*symbols]
-            if request.POST.get('action')!='refresh' and request.POST.get('offline') and not any(s not in instruments() for s in symbols):args.append('--offline')
-            if request.POST.get('action')=='refresh':args.append('--refresh-only')
+            if data_request:args.append('--refresh-only')
+            else:
+                args.append('--offline')
+                if context_mode!='all':args.extend(['--context-symbols',*context_symbols])
             if data_request:args.extend(['--hourly-days',str(hourly_days),'--workers','4'])
+            if data_request and request.POST.get('full_history')=='1':args.append('--full-history')
             with (RUNS/'worker.log').open('a',encoding='utf8') as log:
                 subprocess.Popen(args,cwd=BASE,stdout=log,stderr=log,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
     except Timeout:return HttpResponse('آموزش یا دریافت دیگری در حال اجراست.',status=409)
     if data_request:
         symbol=request.POST.get('view_symbol')
         return redirect('/data/?'+urlencode(dict(symbol=symbol if symbol in instruments() else symbols[0])))
-    return redirect('dashboard')
+    return redirect('/training/?'+urlencode(dict(symbol=symbols[0])))
 
 @require_POST
 def retain(request):
@@ -213,8 +247,8 @@ def retain(request):
                 name=request.POST.get('name','').strip()[:100] or row['label']
                 marker=RUNS/row['run_id']/'saved.json'
                 old=json.loads(marker.read_text(encoding='utf8')) if marker.exists() else {}
-                prediction_file=RUNS/row['run_id']/'predictions.csv'
-                ready=set(pd.read_csv(prediction_file,dtype={'insCode':str}).insCode) if prediction_file.exists() else set()
+                prediction_file=table_path(RUNS/row['run_id']/'predictions.json')
+                ready=set(read_table(prediction_file,dtype={'insCode':str}).insCode) if prediction_file.exists() else set()
                 if request.POST.get('scope')=='symbol':
                     code=instruments().get(request.POST.get('symbol'))
                     if not code or code not in ready or not (RUNS/row['run_id']/f'{code}_lstm.keras').exists():return HttpResponseBadRequest('مدل این نماد ارزیابی کامل ندارد')
@@ -255,7 +289,7 @@ def download_model(request):
     folder=RUNS/row['run_id']
     required=[folder/f'{code}_lstm.keras',folder/f'{code}_preprocessing.json']
     if not all(p.exists() for p in required):return HttpResponseBadRequest('مدل یا مقیاس‌بندی ناقص است')
-    files=required+[p for p in [folder/'neural_network.py',folder/'neural_data.py',folder/'hourly_data.py',folder/'environment.json',folder/f'{code}_architecture.txt'] if p.exists()]
+    files=required+[p for p in [folder/'neural_network.py',folder/'neural_data.py',folder/'hourly_data.py',folder/'return_data.py',folder/'scenarios.py',folder/f'{code}_residuals.npz',folder/'environment.json',folder/f'{code}_architecture.txt'] if p.exists()]
     buffer=io.BytesIO();manifest={}
     with zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as archive:
         for p in files:
@@ -267,7 +301,13 @@ def download_model(request):
 @require_POST
 def refresh_prediction(request):
     run=request.POST.get('run');symbol=request.POST.get('symbol')
-    if run not in {r['run_id'] for r in list_runs(RUNS)} or symbol not in instruments():return HttpResponseBadRequest('مدل یا نماد نامعتبر')
+    known=instruments();_,store=settings_store()
+    row=next((r for r in catalog(list_runs(RUNS),RUNS,store) if r['run_id']==run),None)
+    if row is None or symbol not in known:return HttpResponseBadRequest('مدل یا نماد نامعتبر')
+    config_path=RUNS/run/f'{known[symbol]}_preprocessing.json'
+    if config_path.exists() and json.loads(config_path.read_text(encoding='utf8')).get('target_schema')=='hourly_returns_v2':
+        return HttpResponseBadRequest('برنامهٔ ساعت‌های این مدل ناسازگار است؛ برای افق کامل ۲۱ جلسه، مدل جدید را بازآموزی کنید.')
+    if not reusable(RUNS,row,known[symbol]):return HttpResponseBadRequest('وزن مدل این نماد موجود نیست یا آموزش کامل نشده است؛ خروجی تاریخی قابل مشاهده است ولی برای پیش‌بینی تازه باید مدل این نماد آموزش داده و ذخیره شود.')
     try:
         with FileLock(str(RUNS/'.pipeline.lock'),timeout=0):
             with (RUNS/'inference.log').open('a',encoding='utf8') as log:
@@ -278,3 +318,20 @@ def refresh_prediction(request):
 def prediction_status(request):
     path=RUNS/'inference_status.json'
     return JsonResponse(json.loads(path.read_text(encoding='utf8')) if path.exists() else {'state':'idle'})
+
+
+@require_POST
+@csrf_protect
+def delete_model(request):
+    run_id=request.POST.get('run','')
+    try:
+        with model_mutation_lock(RUNS):
+            _,store=settings_store()
+            rows=model_records(RUNS,store,list_runs(RUNS),instruments())
+            row=next((r for r in rows if r['run_id']==run_id),None)
+            if row is None:return HttpResponseBadRequest('مدل یافت نشد.')
+            if row.get('state')=='running':return HttpResponse('مدل در حال اجرا قابل حذف نیست.',status=409)
+            delete_model_run(RUNS,store,run_id)
+    except Timeout:return HttpResponse('تا پایان آموزش یا پیش‌بینی جاری منتظر بمانید.',status=409)
+    except ValueError:return HttpResponseBadRequest('شناسهٔ مدل نامعتبر است.')
+    return redirect('/training/?model_deleted=1')

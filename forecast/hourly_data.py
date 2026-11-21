@@ -1,4 +1,4 @@
-# توضیح فایل: هدف مستقیم همه ساعت‌های ۲۱ جلسه؛ ماسک هدف مفقود و زمینهٔ بازار با تأخیر یک ساعت برای جلوگیری از نشت.
+# توضیح فایل: هدف مستقیم همه ساعت‌های ۲۱ جلسه؛ ماسک هدف مفقود و زمینهٔ بازار با تاریخ/ساعت دقیق؛ حالت lagged فقط برای مدل‌های قدیمی محفوظ است.
 # prepare_hourly_sequences ورودی/هدف؛ clean_context کنترل یکسان زمینه در آموزش/پیش‌بینی؛ scale_hourly مقیاس فقط آموزشی.
 import numpy as np
 import pandas as pd
@@ -7,7 +7,7 @@ from .neural_data import prepare_sequences
 STEPS=21*24
 
 
-def clean_context(frame,daily,symbol='',code=''):
+def clean_context(frame,daily,symbol='',code='',include_closed_hours=False):
     """Accept only complete, finite OHLCV sessions, identically at train and inference."""
     if not frame.empty:
         frame=frame.copy()
@@ -16,14 +16,19 @@ def clean_context(frame,daily,symbol='',code=''):
         dates=pd.to_datetime(frame.Date).dt.normalize()
         reference=dict(zip(pd.to_datetime(daily.Date).dt.normalize(),pd.to_numeric(daily.qTotTran5J,errors='coerce')))
         now=pd.Timestamp.now(tz='Asia/Tehran');today=now.tz_localize(None).normalize()
+        if include_closed_hours:
+            frame=frame[(dates<today)|(pd.to_datetime(frame.Hour)+pd.Timedelta(hours=1)<=now.tz_localize(None))].copy()
+            dates=pd.to_datetime(frame.Date).dt.normalize()
         valid=(frame.DataQuality.eq('matched') & np.isfinite(frame[numeric]).all(axis=1)
                & (frame[numeric]>0).all(axis=1) & ~frame.Hour.duplicated(keep=False)
                & (frame.High>=frame[['Open','Close','Low']].max(axis=1))
                & (frame.Low<=frame[['Open','Close']].min(axis=1))
                & pd.to_datetime(frame.Hour).dt.normalize().eq(dates)
-               & ((dates<today)|((dates==today)&(now.hour>=18))))
+               & ((dates<today)|((dates==today)&((now.hour>=18) | (include_closed_hours & (pd.to_datetime(frame.Hour)+pd.Timedelta(hours=1)<=now.tz_localize(None)))))))
         sums=frame.Volume.groupby(dates).sum();totals=pd.Series(sums.index.map(reference),index=sums.index,dtype=float)
-        accepted=valid.groupby(dates).all() & (totals>0) & ((sums/totals-1).abs()<=.001)
+        volume_ok=(sums/totals-1).abs()<=.001
+        if include_closed_hours:volume_ok |= (sums.index==today)&(sums<=totals*1.001)
+        accepted=valid.groupby(dates).all() & (totals>0) & volume_ok
         frame=frame[dates.isin(accepted[accepted].index)].copy()
     frame.attrs.update(symbol=symbol,code=str(code))
     return frame
@@ -42,7 +47,7 @@ def market_context(frames):
     groups=combined.groupby('Hour').r
     return pd.DataFrame(dict(mean_return=groups.mean(),breadth=groups.apply(lambda r:float((r>0).mean())),coverage=groups.count()/max(len(frames),1)))
 
-def prepare_hourly_sequences(hourly,daily,context_frames=(),allow_unlabeled=False,latest_only=False):
+def prepare_hourly_sequences(hourly,daily,context_frames=(),allow_unlabeled=False,latest_only=False,alignment="exact"):
     x,mask,_,meta,lx,lm,latest=prepare_sequences(hourly,daily,require_all_targets=False,allow_unlabeled=allow_unlabeled,latest_only=latest_only)
     active=daily[(daily.qTotTran5J>0)&(daily.zTotTran>0)].copy()
     calendar=pd.DatetimeIndex(sorted(pd.to_datetime(active.Date).dt.normalize().unique()))
@@ -85,10 +90,10 @@ def prepare_hourly_sequences(hourly,daily,context_frames=(),allow_unlabeled=Fals
             for i,row in enumerate(rows):
                 dates=calendar[(calendar>=pd.Timestamp(row['window_start']))&(calendar<=pd.Timestamp(row['as_of']).normalize())]
                 hours=pd.DatetimeIndex(np.concatenate([pd.to_datetime(valid[d].Hour).to_numpy() for d in dates]))
-                prior=hours-pd.Timedelta(hours=1)
+                prior=hours-pd.Timedelta(hours=1) if alignment=='lagged' else hours
                 returns=[];sessions=[];availability=[]
                 for j,series in enumerate(individual):
-                    aligned=series.reindex(prior,method='ffill',tolerance=pd.Timedelta(days=4)) if not series.empty else series.reindex(prior)
+                    aligned=series.reindex(prior,method='ffill',tolerance=pd.Timedelta(days=4)) if alignment=='lagged' and not series.empty else series.reindex(prior)
                     r=aligned.r.fillna(0).to_numpy(dtype='float32')
                     sr=aligned.session_return.fillna(0).to_numpy(dtype='float32')
                     available=aligned.available.fillna(0).to_numpy(dtype='float32')
@@ -107,7 +112,7 @@ def prepare_hourly_sequences(hourly,daily,context_frames=(),allow_unlabeled=Fals
     latest['as_of']=str(pd.Timestamp(latest['as_of'])+pd.Timedelta(hours=1))
     latest['target_schema']='hourly_path_v1'
     latest['context_assets']=len(context_frames)
-    latest['feature_schema']='cross_asset_v2'
+    latest['feature_schema']='cross_asset_v2' if alignment=='lagged' else 'cross_asset_exact_v3'
     return x,mask,y,meta,lx,lm,latest
 
 def scale_hourly(x,mask,lx,lm,y,splits):

@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 from forecast.registry import settings_store
-from market_data.csv_store import _write_bytes_atomic,_csv_atomic
+from market_data.csv_store import _write_bytes_atomic
 
 def main():
  settings,store=settings_store();rows=[]
@@ -17,7 +17,6 @@ def main():
   active=daily[(daily.qTotTran5J>0)&(daily.zTotTran>0)]
   dates=active.Date if name in original else active.loc[active.Date>=pd.Timestamp('2021-10-21'),'Date']
   coverage=pd.DataFrame([dict(Symbol=name,insCode=code,Date=date,quality=store.day_quality(code,date),error=store.day_error(code,date)) for date in dates])
-  _csv_atomic(coverage,settings.root/'coverage'/f'{code}.csv')
   rows.append(dict(symbol=name,code=code,daily_rows=len(daily),hourly_rows=len(hourly),daily_start=str(daily.Date.min().date()),daily_end=str(daily.Date.max().date()),hourly_start=str(hourly.Date.min().date()) if not hourly.empty else None,hourly_end=str(hourly.Date.max().date()) if not hourly.empty else None,expected_days=len(dates),coverage={str(k):int(v) for k,v in coverage.quality.value_counts().items()}))
  report=dict(integrity=integrity,daily_scope='all available API history',new_assets_hourly_requested_start='2021-10-21',daily_rows=sum(r['daily_rows'] for r in rows),hourly_rows=sum(r['hourly_rows'] for r in rows),instruments=rows)
  _write_bytes_atomic(settings.root/'data_audit.json',json.dumps(report,ensure_ascii=False,indent=2))

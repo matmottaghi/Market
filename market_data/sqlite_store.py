@@ -63,6 +63,28 @@ class SqliteMarketStore(CsvMarketStore):
                 FROM instruments i ORDER BY i.symbol''').fetchall()
         return [dict(zip(['symbol','daily','hourly','daily_end','hourly_end','issues','code','last_hour','daily_start','hourly_start'],row)) for row in rows]
 
+    def delete_instrument(self,code):
+        """Remove active symbol data transactionally after writing a recovery archive."""
+        import gzip
+        code=_code(str(code))
+        archive_dir=self.root/'deleted_symbols';archive_dir.mkdir(exist_ok=True)
+        archive=archive_dir/(code+'_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')+'.json.gz')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            tables={name:db.execute(f'SELECT * FROM {name} WHERE code=?',(code,)).fetchall()
+                    for name in ('instruments','daily_bars','hourly_bars','ingestion_issues')}
+            if not tables['instruments']:raise ValueError('Unknown instrument')
+            tables['snapshots']=db.execute('SELECT * FROM snapshots WHERE underlying=?',(code,)).fetchall()
+            tables['model_registry']=db.execute('SELECT * FROM model_registry WHERE id=?',('active:'+code,)).fetchall()
+            with gzip.open(archive,'wt',encoding='utf8') as output:
+                json.dump(dict(version=1,code=code,deleted_at=datetime.now(timezone.utc).isoformat(),tables=tables),output,ensure_ascii=False)
+            for name in ('daily_bars','hourly_bars','ingestion_issues','instruments'):
+                db.execute(f'DELETE FROM {name} WHERE code=?',(code,))
+            db.execute('DELETE FROM snapshots WHERE underlying=?',(code,))
+            db.execute('DELETE FROM model_registry WHERE id=?',('active:'+code,))
+        self.state_path(code).unlink(missing_ok=True)
+        return archive
+
     def latest_rows(self,code,frequency,limit=10):
         """Read a bounded newest-first preview; never load complete history for a table."""
         if frequency not in ('daily','hourly'):raise ValueError('Unknown frequency')
@@ -108,7 +130,7 @@ class SqliteMarketStore(CsvMarketStore):
                 code=_code(str(row['insCode']));date=str(pd.Timestamp(row['Date']).date())
                 added+=not bool(db.execute('SELECT 1 FROM daily_bars WHERE code=? AND date=?',(code,date)).fetchone())
                 row['Date']=date
-                db.execute('INSERT INTO daily_bars VALUES(?,?,?,?,?,?) ON CONFLICT(code,date) DO UPDATE SET close=excluded.close,volume=excluded.volume,payload=excluded.payload,ingested_at=excluded.ingested_at',(code,date,row.get('pClosing'),row.get('qTotTran5J'),json.dumps(row,ensure_ascii=False,allow_nan=False),now))
+                db.execute('INSERT INTO daily_bars VALUES(?,?,?,?,?,?) ON CONFLICT(code,date) DO UPDATE SET close=excluded.close,volume=excluded.volume,payload=excluded.payload,ingested_at=excluded.ingested_at WHERE daily_bars.payload<>excluded.payload',(code,date,row.get('pClosing'),row.get('qTotTran5J'),json.dumps(row,ensure_ascii=False,allow_nan=False),now))
         return dict(months_touched=len({str(r['Date'])[:7] for r in records}),incoming_rows=len(records),new_rows=int(added))
 
     def day_quality(self,code,date):
@@ -151,7 +173,7 @@ class SqliteMarketStore(CsvMarketStore):
             db.execute('INSERT INTO ingestion_issues VALUES(?,?,?,?) ON CONFLICT(code,date) DO UPDATE SET error=excluded.error,retry_after=excluded.retry_after',(_code(ins_code),str(pd.Timestamp(date).date()),str(error)[:1000],(datetime.now(timezone.utc)+timedelta(hours=retry_after_hours)).isoformat()))
 
     def should_fetch_hourly(self,ins_code,date,*,retry_incomplete=False):
-        if self.hourly_exists(ins_code,date,retry_incomplete=retry_incomplete):return False
+        if self.hourly_exists(ins_code,date,retry_incomplete=True):return False
         if retry_incomplete:return True
         with self.connect() as db:
             row=db.execute('SELECT retry_after FROM ingestion_issues WHERE code=? AND date=?',(_code(ins_code),str(pd.Timestamp(date).date()))).fetchone()
@@ -193,7 +215,9 @@ class SqliteMarketStore(CsvMarketStore):
         if not frame.empty:yield frame
 
 def make_store(root):
-    return SqliteMarketStore(root) if (Path(root)/'storage.json').exists() else CsvMarketStore(root)
+    if not (Path(root)/'storage.json').exists() and not (Path(root)/'market.sqlite3').exists() and any((Path(root)/'daily').glob('*/*.csv')):
+        migrate(root)
+    return SqliteMarketStore(root)
 
 def migrate(root):
     if (Path(root)/'storage.json').exists():

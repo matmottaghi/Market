@@ -17,3 +17,17 @@ if(typeof document!=='undefined'&&document.getElementById('symbol-query')){const
 if(typeof document!=='undefined'&&document.getElementById('inference-status')){let active=false;const timer=setInterval(async()=>{try{const s=await(await fetch('/forecast/status/')).json();document.getElementById('inference-status').textContent=(s.label||'')+' '+s.state+(s.error?' — '+s.error:'')+(s.as_of?' — مبنا '+s.as_of:'');if(s.state==='running')active=true;if(active&&s.state!=='running'){clearInterval(timer);location.reload();}}catch(e){}},2000);window.addEventListener('pagehide',()=>clearInterval(timer));}
 
 if(typeof document!=='undefined'&&document.getElementById('days-slider')){const slider=document.getElementById('days-slider'),value=document.getElementById('days-value');slider.oninput=()=>value.value=slider.value;value.oninput=()=>slider.value=value.value;}
+
+
+// Context choice affects new training only; a saved model keeps its frozen universe.
+if(typeof document!=='undefined'&&document.getElementById('training-universe')){
+ const form=document.getElementById('target-training-form'),target=document.getElementById('training-target');
+ const boxes=[...form.querySelectorAll('input[name="context_symbols"]')];
+ function universe(){
+  const mode=form.querySelector('input[name="context_mode"]:checked').value;
+  let count=1;
+  for(const box of boxes){const own=box.value===target.value;box.disabled=mode!=='selected'||own;if(!own&&(mode==='all'||mode==='selected'&&box.checked))count++;}
+  document.getElementById('training-universe-summary').textContent='سهم هدف: '+target.value+' · تعداد کل سهم‌های ورودی: '+count+' · ویژگی‌های ورودی: '+(8*count);
+ }
+ form.addEventListener('change',universe);universe();
+}
