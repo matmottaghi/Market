@@ -32,17 +32,18 @@ def new_model_identity(targets, contexts):
 def model_records(root,store,local_rows,known):
     rows={r['run_id']:dict(r) for r in local_rows if r.get('job_kind')!='data'}
     active=set()
-    with store.connect() as db:
-        for rid,payload in db.execute('SELECT id,manifest FROM training_runs'):
-            row=json.loads(payload)
-            if row.get('job_kind')!='data':rows.setdefault(rid,row)
-        for payload, in db.execute('SELECT manifest FROM model_registry'):
-            active.add(json.loads(payload).get('run_id'))
-        data_runs={rid for rid,payload in db.execute('SELECT id,manifest FROM training_runs') if json.loads(payload).get('job_kind')=='data'}
-        for table in ('forecasts','forecast_metrics','epoch_metrics','forecast_snapshots'):
-            if db.execute('SELECT 1 FROM sqlite_master WHERE name=?',(table,)).fetchone():
-                for rid, in db.execute(f'SELECT DISTINCT run FROM {table}'):
-                    if rid not in data_runs:rows.setdefault(rid,dict(run_id=rid,state='complete',model_kind='lstm'))
+    if hasattr(store,'connect'):
+        with store.connect() as db:
+            for rid,payload in db.execute('SELECT id,manifest FROM training_runs'):
+                row=json.loads(payload)
+                if row.get('job_kind')!='data':rows.setdefault(rid,row)
+            for payload, in db.execute('SELECT manifest FROM model_registry'):
+                active.add(json.loads(payload).get('run_id'))
+            data_runs={rid for rid,payload in db.execute('SELECT id,manifest FROM training_runs') if json.loads(payload).get('job_kind')=='data'}
+            for table in ('forecasts','forecast_metrics','epoch_metrics','forecast_snapshots'):
+                if db.execute('SELECT 1 FROM sqlite_master WHERE name=?',(table,)).fetchone():
+                    for rid, in db.execute(f'SELECT DISTINCT run FROM {table}'):
+                        if rid not in data_runs:rows.setdefault(rid,dict(run_id=rid,state='complete',model_kind='lstm'))
     inverse={code:name for name,code in known.items()}
     result=[]
     for rid,row in rows.items():
